@@ -13,9 +13,9 @@
  *  - 同步查詢使用短 timeout（預設 10 秒），不可沿用 Requester::TIMEOUT = 60。
  *
  * 資安（$_GET['tradeOrderId'] 由客戶瀏覽器帶入，不可信）：
- *  - order_key 閘門 → referenceOrderId 必須等於本訂單 ID → StatusManager 的金額 / 幣別守衛，
+ *  - order_key 閘門 → sessionId 或數字型 referenceOrderId 必須對應本訂單 → StatusManager 的金額 / 幣別守衛，
  *    三道獨立防線。驗證全數通過才寫入 _pc_payment_identity（webhook 的查單主鍵）。
- *  - 三道之中，步驟 ⑥ 的 referenceOrderId 比對是「同金額白嫖攻擊」的唯一防線
+ *  - 三道之中，步驟 ⑥ 的訂單識別碼比對是「同金額白嫖攻擊」的唯一防線
  *    （金額相同時另外兩道都會放行），移除前請先補等效防線——詳見該行上方註解。
  *
  * @see specs/open-issue/issue-18-plan.md §流程 1
@@ -113,22 +113,30 @@ final class ReturnSyncManager {
 			return ReturnSyncResult::API_FAILED;
 		}
 
-		// ⑥ referenceOrderId 比對（第二道資安防線）：查詢結果必須屬於本訂單
+		// ⑥ 訂單識別碼比對（第二道資安防線）：查詢結果必須屬於本訂單
 		//
 		// ⚠️ 安全關鍵：此行是「同金額白嫖攻擊」的唯一防線。
 		// 攻擊者持自己訂單的合法 order_key + 受害者的 tradeOrderId，
 		// 前面的 order_key 閘門會過（key 是他自己的），StatusManager 的金額 / 幣別守衛也會過
 		// （兩筆訂單金額相同時），只有這裡擋得住。
-		// 移除前請先補等效防線——突變測試已證實：拆掉此行，
-		// test_referenceOrderId指向別的訂單時拒絕認列 立刻轉紅。
+		// Session/SDK 流程由 SLP 回傳 RL 型 referenceOrderId，改用建立 session 時儲存的
+		// _pc_identity 驗證；舊版數字型 referenceOrderId 仍可直接對照訂單 ID。
 		$reference_order_id = $payment_dto->referenceOrderId;
-		if ($reference_order_id !== (string) $this->order->get_id()) {
+		$session_id         = isset($payment_dto->sessionId) ? $payment_dto->sessionId : '';
+		$stored_session_id  = ( new MetaKeys( $this->order ) )->get_identity();
+		$reference_matches  = $reference_order_id === (string) $this->order->get_id();
+		$session_matches    = '' !== $session_id && '' !== $stored_session_id
+		&& \hash_equals($stored_session_id, $session_id);
+		// 數字型 referenceOrderId 若明確指向別張訂單，sessionId 命中也不能覆蓋衝突。
+		$reference_conflicts = \ctype_digit($reference_order_id) && !$reference_matches;
+		if ($reference_conflicts || ( !$reference_matches && !$session_matches )) {
 			$this->gateway->logger(
 				"❌ {$this->gateway->title} 導回同步查詢結果不屬於本訂單 #{$this->order->get_id()}",
 				'error',
 				[
 					'tradeOrderId'     => $trade_order_id,
 					'referenceOrderId' => $reference_order_id,
+					'sessionId'        => $session_id,
 				],
 				5
 			);
@@ -164,7 +172,7 @@ final class ReturnSyncManager {
 	 * @return string 通過白名單的 tradeOrderId，不合則回傳空字串
 	 */
 	private function get_trade_order_id(): string {
-		// 導回頁由 SLP 帶參數（無 nonce），改以 order_key + referenceOrderId 雙重驗證；
+		// 導回頁由 SLP 帶參數（無 nonce），以 order_key + 訂單識別碼雙重驗證；
 		// unslash / sanitize 於下方緊接著執行，故此處忽略 sniff。
 		$raw = $_GET['tradeOrderId'] ?? ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized, WordPress.Security.ValidatedSanitizedInput.MissingUnslash
 		if (!\is_string($raw)) {

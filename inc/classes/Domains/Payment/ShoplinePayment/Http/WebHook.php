@@ -90,7 +90,11 @@ final class WebHook extends ApiBase {
 			}
 
 			if ($webhook_data_dto instanceof Webhooks\Payment && $webhook_data_dto->is_successed_or_failed()) {
-				$order = OrderResolver::resolve( $webhook_data_dto->tradeOrderId, $webhook_data_dto->referenceOrderId );
+				$order = OrderResolver::resolve(
+					$webhook_data_dto->tradeOrderId,
+					$webhook_data_dto->referenceOrderId,
+					isset($webhook_data_dto->sessionId) ? $webhook_data_dto->sessionId : ''
+				);
 
 				if (!$order) {
 					throw new \Exception("找不到訂單，tradeOrderId: {$webhook_data_dto->tradeOrderId}, referenceOrderId: {$webhook_data_dto->referenceOrderId}");

@@ -17,6 +17,7 @@ use J7\PowerCheckout\Domains\Payment\ShoplinePayment\Shared\Traits\OrderTrait;
 use J7\PowerCheckout\Domains\Payment\ShoplinePayment\Shared\Traits\PaymentMsgTrait;
 use J7\PowerCheckout\Domains\Payment\ShoplinePayment\Shared\Traits\PaymentTrait;
 use J7\PowerCheckout\Domains\Payment\ShoplinePayment\Shared\Traits\ReferenceOrderIdTrait;
+use J7\PowerCheckout\Domains\Payment\ShoplinePayment\Shared\Traits\SessionIdTrait;
 use J7\PowerCheckout\Domains\Payment\ShoplinePayment\Shared\Traits\StatusTrait;
 use J7\PowerCheckout\Domains\Payment\ShoplinePayment\Shared\Traits\TradeOrderIdTrait;
 use J7\WpUtils\Classes\DTO;
@@ -30,6 +31,7 @@ use J7\WpUtils\Classes\WP;
  */
 class PaymentDTO extends DTO {
 	use ReferenceOrderIdTrait;
+	use SessionIdTrait;
 	use TradeOrderIdTrait;
 	use StatusTrait;
 	use PaymentMsgTrait;

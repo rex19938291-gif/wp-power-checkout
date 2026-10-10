@@ -89,6 +89,26 @@ class MetaKeys {
 		return ( $order instanceof \WC_Order ) ? $order : null;
 	}
 
+	/** @return \WC_Order|null 以結帳 sessionId 唯一反查訂單 */
+	public static function get_order_by_identity_key( string $identity_value ): \WC_Order|null {
+		if ('' === $identity_value) {
+			return null;
+		}
+
+		$orders = \wc_get_orders(
+			[
+				'limit'      => 2,
+				'meta_key'   => self::IDENTITY_KEY, // phpcs:ignore
+				'meta_value' => $identity_value, // phpcs:ignore
+			]
+		);
+		if (!\is_array($orders) || 1 !== \count($orders)) {
+			return null;
+		}
+		$order = \reset($orders);
+		return $order;
+	}
+
 
 	/** @return array<string, mixed> 取得付款詳情 array */
 	public function get_payment_detail(): array {
