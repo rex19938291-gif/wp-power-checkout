@@ -229,6 +229,81 @@ final class SlpReturnSyncTest extends TestCase {
 		return ( new ReturnSyncManager( new RedirectGateway(), $order ) )->sync();
 	}
 
+	/**
+	 * Issue #19: Session payments return an RL referenceOrderId while the
+	 * sessionId is the value saved on the WooCommerce order at checkout.
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_session_payment_with_rl_reference_is_recognized_on_return(): void {
+		$order          = $this->make_slp_order();
+		$session_id     = 'se_issue_19_return';
+		$trade_order_id = 'TRADE_ISSUE_19_RETURN';
+		( new MetaKeys( $order ) )->update_identity( $session_id );
+		$this->simulate_return( $order, $trade_order_id );
+		$body                = $this->make_payment_body( $trade_order_id, 'RL_ISSUE_19_RETURN' );
+		$body['sessionId']   = $session_id;
+		$body['acquireType'] = 'SDK';
+		$body['actionType']  = 'SDK';
+		$this->mock_http_json( $body );
+
+		$this->assertSame( ReturnSyncResult::UPDATED, $this->sync( $order ) );
+		$this->assert_order_status( $order, 'processing' );
+		$fresh = \wc_get_order( $order->get_id() );
+		$this->assertInstanceOf( \WC_Order::class, $fresh );
+		$this->assertSame( $trade_order_id, ( new MetaKeys( $fresh ) )->get_payment_identity() );
+	}
+
+	/**
+	 * A valid order key and equal amount cannot authorize another order's payment.
+	 *
+	 * @test
+	 * @group security
+	 */
+	public function test_session_payment_for_another_order_is_rejected_on_return(): void {
+		$order          = $this->make_slp_order();
+		$victim         = $this->make_slp_order();
+		$trade_order_id = 'TRADE_ISSUE_19_FOREIGN';
+		( new MetaKeys( $order ) )->update_identity( 'se_issue_19_own' );
+		( new MetaKeys( $victim ) )->update_identity( 'se_issue_19_foreign' );
+		$this->simulate_return( $order, $trade_order_id );
+		$body              = $this->make_payment_body( $trade_order_id, 'RL_ISSUE_19_FOREIGN' );
+		$body['sessionId'] = 'se_issue_19_foreign';
+		$this->mock_http_json( $body );
+
+		$this->assertSame( ReturnSyncResult::MISMATCHED_ORDER, $this->sync( $order ) );
+		$this->assert_order_status( $order, 'pending' );
+		$fresh = \wc_get_order( $order->get_id() );
+		$this->assertInstanceOf( \WC_Order::class, $fresh );
+		$this->assertSame( '', ( new MetaKeys( $fresh ) )->get_payment_identity() );
+	}
+
+	/**
+	 * A numeric reference is an explicit WooCommerce order ID. If it conflicts
+	 * with the saved session, the response is ambiguous and must be rejected.
+	 *
+	 * @test
+	 * @group security
+	 */
+	public function test_matching_session_with_foreign_numeric_reference_is_rejected(): void {
+		$order          = $this->make_slp_order();
+		$victim         = $this->make_slp_order();
+		$trade_order_id = 'TRADE_ISSUE_19_CONFLICT';
+		$session_id     = 'se_issue_19_conflict';
+		( new MetaKeys( $order ) )->update_identity( $session_id );
+		$this->simulate_return( $order, $trade_order_id );
+		$body              = $this->make_payment_body( $trade_order_id, (string) $victim->get_id() );
+		$body['sessionId'] = $session_id;
+		$this->mock_http_json( $body );
+
+		$this->assertSame( ReturnSyncResult::MISMATCHED_ORDER, $this->sync( $order ) );
+		$this->assert_order_status( $order, 'pending' );
+		$fresh = \wc_get_order( $order->get_id() );
+		$this->assertInstanceOf( \WC_Order::class, $fresh );
+		$this->assertSame( '', ( new MetaKeys( $fresh ) )->get_payment_identity() );
+	}
+
 	// ========== 冒煙測試（Smoke） ==========
 
 	/**

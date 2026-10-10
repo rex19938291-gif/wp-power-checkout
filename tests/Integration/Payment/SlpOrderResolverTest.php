@@ -129,7 +129,7 @@ final class SlpOrderResolverTest extends TestCase {
 	 * @param string $status             ResponseStatus（SUCCEEDED / FAILED …）
 	 * @return \WP_REST_Response
 	 */
-	private function post_trade_webhook( string $trade_order_id, string $reference_order_id, string $status ): \WP_REST_Response {
+	private function post_trade_webhook( string $trade_order_id, string $reference_order_id, string $status, string $session_id = '' ): \WP_REST_Response {
 		Plugin::$env = 'local';
 
 		$body = [
@@ -163,6 +163,9 @@ final class SlpOrderResolverTest extends TestCase {
 				],
 			],
 		];
+		if ( '' !== $session_id ) {
+			$body['data']['sessionId'] = $session_id;
+		}
 
 		$request = new \WP_REST_Request( 'POST', '/power-checkout/slp/webhook' );
 		$request->set_header( 'Content-Type', 'application/json' );
@@ -171,6 +174,53 @@ final class SlpOrderResolverTest extends TestCase {
 		$request->set_body( (string) \wp_json_encode( $body ) );
 
 		return WebHook::instance()->post_webhook_callback( $request );
+	}
+
+	/**
+	 * Issue #19: SLP SDK webhooks use an RL reference, with sessionId identifying
+	 * the order that was saved during session creation.
+	 *
+	 * @test
+	 * @group happy
+	 */
+	public function test_session_webhook_with_rl_reference_recognizes_order(): void {
+		$order          = $this->make_order( RedirectGateway::ID, null, 'pending' );
+		$trade_order_id = 'TRADE_ISSUE_19_WEBHOOK';
+		$session_id     = 'se_issue_19_webhook';
+		( new MetaKeys( $order ) )->update_identity( $session_id );
+
+		$response = $this->post_trade_webhook( $trade_order_id, 'RL_ISSUE_19_WEBHOOK', 'SUCCEEDED', $session_id );
+
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertNull( $response->get_data(), 'Webhook should resolve the order without a mapping error' );
+		$this->assert_order_status( $order, 'processing' );
+		$fresh = \wc_get_order( $order->get_id() );
+		$this->assertInstanceOf( \WC_Order::class, $fresh );
+		$this->assertSame( $trade_order_id, ( new MetaKeys( $fresh ) )->get_payment_identity() );
+	}
+
+	/**
+	 * An RL reference with no matching saved session must never claim an order.
+	 *
+	 * @test
+	 * @group security
+	 */
+	public function test_rl_reference_with_unknown_session_cannot_claim_order(): void {
+		$order = $this->make_order( RedirectGateway::ID, null, 'pending' );
+		( new MetaKeys( $order ) )->update_identity( 'se_issue_19_known' );
+
+		$response = $this->post_trade_webhook(
+			'TRADE_ISSUE_19_UNKNOWN',
+			'RL_ISSUE_19_UNKNOWN',
+			'SUCCEEDED',
+			'se_issue_19_other'
+		);
+
+		$this->assertSame( 200, $response->get_status() );
+		$this->assert_order_status( $order, 'pending' );
+		$fresh = \wc_get_order( $order->get_id() );
+		$this->assertInstanceOf( \WC_Order::class, $fresh );
+		$this->assertSame( '', ( new MetaKeys( $fresh ) )->get_payment_identity() );
 	}
 
 	// ========== 冒煙測試（Smoke） ==========
