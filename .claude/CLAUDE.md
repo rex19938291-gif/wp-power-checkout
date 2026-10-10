@@ -98,7 +98,7 @@ inc/classes/
 │   │   ├── ShoplinePayment/         # SLP: redirect gateway, API client, webhook
 │   │   │   ├── Managers/StatusManager.php    # Idempotency + terminal/currency/amount guards; StatusSource label
 │   │   │   ├── Managers/ReturnSyncManager.php # Return-sync query + settle (never-throw, throttled, order_key gated)
-│   │   │   ├── Managers/OrderResolver.php     # Webhook lookup: identity → referenceOrderId fallback + gateway check
+│   │   │   ├── Managers/OrderResolver.php     # Webhook lookup: identity → sessionId → referenceOrderId fallback + gateway check
 │   │   │   └── Shared/Exceptions/SignatureException.php # Distinguishes 401 (retryable) from 200 (do-not-retry)
 │   │   ├── EcpayAIO/                # ECPay AIO redirect gateway (ID: ecpay_aio)
 │   │   │   ├── Services/AioRedirectGateway.php
@@ -294,12 +294,12 @@ ECPay callbacks use `permission_callback: __return_true`; auth is verified insid
 
 1. `process_payment()` → `ApiClient::create_session()` → writes `_pc_identity` (sessionId, before the EXPIRED check) → redirect to SLP hosted page
 2. **Return sync (issue #18)**: customer redirected back to `order-received?key=…&tradeOrderId=…` → `before_order_received()` delegates to `Managers/ReturnSyncManager::sync()`, which queries `/trade/payment/get` **synchronously** and settles payment in the same request (the `wp` action runs before `the_content`, so the thankyou template re-reads the corrected status)
-   - Gates in order: `tradeOrderId` regex whitelist `[A-Za-z0-9_-]{1,64}` → `order_key` `hash_equals` → status must be pending/failed → 30s transient throttle `pc_slp_return_sync_{order_id}` → API query (10s timeout, filter `power_checkout_slp_return_query_timeout`) → `referenceOrderId === (string) $order->get_id()` → write `_pc_payment_identity` → `StatusManager`
+   - Gates in order: `tradeOrderId` regex whitelist `[A-Za-z0-9_-]{1,64}` → `order_key` `hash_equals` → status must be pending/failed → 30s transient throttle `pc_slp_return_sync_{order_id}` → API query (10s timeout, filter `power_checkout_slp_return_query_timeout`) → order-ownership check (issue #19): `sessionId === _pc_identity` **or** `referenceOrderId === (string) $order->get_id()`; a numeric `referenceOrderId` pointing at another order is always rejected (Session/SDK flows — installments / BNPL / bank transfer — return an `RL…` referenceOrderId, so `sessionId` is the only usable key there) → write `_pc_payment_identity` → `StatusManager`
    - **never-throw**: `sync()` returns a `ReturnSyncResult` enum instead of throwing; `before_order_received()` wraps it in a second try/catch. The thankyou page must never 500 nor skip `empty_cart()`
 3. SLP sends webhook POST to `/wp-json/power-checkout/slp/webhook`
 4. Webhook signature: `hash_hmac('sha256', "{timestamp}.{body}", $signKey)`
    - Response codes: signature mismatch → **401** (merchant may have mis-typed signKey; keep SLP's retry); everything else (stale timestamp / DTO parse failure / order not found / business exception / success) → **200**. Never 500 — SLP retries every 60 min forever
-5. Webhook order lookup goes through `Managers/OrderResolver::resolve($tradeOrderId, $referenceOrderId)`: `_pc_payment_identity` first → `referenceOrderId` fallback (immune to "customer never returned") → gateway check (`payment_method === shopline_payment_redirect`) → consistency re-check → back-fills identity on fallback hit
+5. Webhook order lookup goes through `Managers/OrderResolver::resolve($tradeOrderId, $referenceOrderId, $sessionId)`: `_pc_payment_identity` first → `sessionId` ↔ `_pc_identity` (unique match; issue #19) → numeric `referenceOrderId` fallback (both fallbacks immune to "customer never returned") → gateway check (`payment_method === shopline_payment_redirect`) → consistency re-check (numeric `referenceOrderId` must equal the order ID; non-numeric reference + `sessionId` must equal `_pc_identity`) → back-fills identity on fallback hit
 6. `StatusManager::update_order_status($source)`: SUCCEEDED→processing (+ `set_transaction_id`), EXPIRED→cancelled, others→pending. Shared by both paths, with four guards:
    - Idempotency: `_pc_payment_processed_status` holds `"{tradeOrderId}:{status}"`
    - Terminal-state guard (SUCCEEDED only): refunded / cancelled / completed cannot be "revived"
@@ -564,8 +564,8 @@ Environment: dev `https://invoiceapi-dev.paynow.com.tw` / prod `https://invoicea
 
 | Key | Purpose |
 |---|---|
-| `_pc_identity` | Third-party session identifier — SLP `sessionId`; written by `before_process_payment()` before the EXPIRED check |
-| `_pc_payment_identity` | tradeOrderId (idempotency guard) — SLP; written **only after** `order_key` + `referenceOrderId` verification (return sync) or by `OrderResolver` back-fill (webhook) |
+| `_pc_identity` | Third-party session identifier — SLP `sessionId`; written by `before_process_payment()` before the EXPIRED check; also the order-ownership key for Session/SDK payments in return sync + webhook (issue #19) |
+| `_pc_payment_identity` | tradeOrderId (idempotency guard) — SLP; written **only after** `order_key` + `sessionId`/`referenceOrderId` verification (return sync) or by `OrderResolver` back-fill (webhook) |
 | `_pc_payment_detail` | Payment details (admin display) — SLP |
 | `_pc_refund_detail` | Refund details — SLP |
 | `_pc_payment_processed_status` | Idempotency guard array — elements: `"{tradeOrderId}:{status}"`; shared by return sync and webhook — SLP |
