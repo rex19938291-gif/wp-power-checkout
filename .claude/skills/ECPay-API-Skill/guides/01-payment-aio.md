@@ -909,7 +909,10 @@ try {
         $input,
         'https://payment.ecpay.com.tw/CreditDetail/DoAction'  // ⚠️ Stage 環境不支援 DoAction（無法實際授權），須使用正式環境
     );
-    // 回應格式：RtnCode|RtnMsg，例如 "1|OK"
+    // 回應格式：URL-encoded 字串（以 & 和 = 解析，見 guides/19 協議表），**不是** RtnCode|RtnMsg
+    // 例如 "MerchantID=3002607&Merchant=3002607&MerchantTradeNo=...&TradeNo=...&RtnCode=1&RtnMsg=Succeeded."
+    // parse_str($response, $result); $result['RtnCode'] === '1' 為成功
+    // （"1|OK" 是商家回應綠界 ReturnURL callback 的格式，與 DoAction 回應無關，勿混用）
 } catch (\Exception $e) {
     error_log('ECPay Capture Error: ' . $e->getMessage());
     // 依業務需求處理（通知管理員、重試等）
