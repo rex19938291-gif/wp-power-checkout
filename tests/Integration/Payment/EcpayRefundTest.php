@@ -234,12 +234,15 @@ final class EcpayRefundTest extends TestCase {
 	}
 
 	/**
-	 * DoAction 回應解析：RtnCode=1 為成功
+	 * DoAction 回應解析：URL-encoded 字串（`&` / `=`）且 RtnCode=1 為成功
+	 *
+	 * 綠界 /CreditDetail/DoAction 回應為 URL-encoded 字串（Issue #20；
+	 * ECPay-API-Skill guides/19-http-protocol-reference.md §回應格式對照表），非 `RtnCode|RtnMsg`。
 	 *
 	 * @test
 	 * @group happy
 	 */
-	public function test_DoAction回應pipe格式RtnCode為1時解析成功(): void {
+	public function test_DoAction回應URL編碼格式RtnCode為1時解析成功(): void {
 		// Given
 		$order  = $this->create_ecpay_order(
 			AioRedirectGateway::ID,
@@ -250,16 +253,18 @@ final class EcpayRefundTest extends TestCase {
 		);
 		$client = new DoActionClient( $order );
 
-		// When: 解析綠界 pipe-separated 回應
-		$result = $client->parse_response( '1|OK' );
+		// When: 解析綠界 URL-encoded 回應
+		$result = $client->parse_response(
+			"MerchantID=3002607&MerchantTradeNo=MTN{$order->get_id()}&TradeNo=2026060412345678&RtnCode=1&RtnMsg=Succeeded."
+		);
 
 		// Then
 		$this->assertSame( '1', $result['RtnCode'] );
-		$this->assertSame( 'OK', $result['RtnMsg'] );
+		$this->assertSame( 'Succeeded.', $result['RtnMsg'] );
 	}
 
 	/**
-	 * DoAction 回應 RtnCode 非 1 → 拋例外並記錄 order note
+	 * DoAction 回應 RtnCode 非 1 → 拋例外並記錄 order note（含「勿重複操作」提醒）
 	 *
 	 * @test
 	 * @group error
@@ -275,14 +280,18 @@ final class EcpayRefundTest extends TestCase {
 		);
 		$client = new DoActionClient( $order );
 
-		// When / Then
+		// When / Then：RtnMsg 為 URL-encoded「退款失敗」
 		try {
-			$client->parse_response( '10100050|退款失敗' );
+			$client->parse_response(
+				"MerchantID=3002607&MerchantTradeNo=MTN{$order->get_id()}&TradeNo=2026060412345678&RtnCode=10100050&RtnMsg=%E9%80%80%E6%AC%BE%E5%A4%B1%E6%95%97"
+			);
 			$this->fail( '預期 RtnCode 非 1 應拋例外' );
 		} catch ( \Throwable $e ) {
 			$this->assertStringContainsString( '10100050', $e->getMessage() );
+			$this->assertStringContainsString( '退款失敗', $e->getMessage() );
 		}
 		$this->assert_order_note_contains( wc_get_order( $order->get_id() ), '10100050' );
+		$this->assert_order_note_contains( wc_get_order( $order->get_id() ), '勿重複操作' );
 	}
 
 	/**

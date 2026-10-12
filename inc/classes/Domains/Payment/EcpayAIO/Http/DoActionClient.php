@@ -2,7 +2,8 @@
 /**
  * 綠界 AIO 信用卡 DoAction（請款 / 退款 / 取消授權）API client
  *
- * 端點：/CreditDetail/DoAction（CMV-SHA256 協議，回應為 pipe-separated `RtnCode|RtnMsg`）。
+ * 端點：/CreditDetail/DoAction（CMV-SHA256 協議，回應為 URL-encoded 字串，以 `&` / `=` 解析為 key-value，
+ * 例：`MerchantID=...&MerchantTradeNo=...&TradeNo=...&RtnCode=1&RtnMsg=Succeeded.`；**不是** `RtnCode|RtnMsg`）。
  * 支援 Action：C 請款（關帳）、N 放棄（取消授權 / 取消請款）、R 退款（退刷）。
  *
  * ⚠️ 重要限制（Source: ECPay-API-Skill guides/01-payment-aio.md §信用卡請款 / 退款 / 取消，2026-06）：
@@ -12,10 +13,16 @@
  *  - Action=C 請款（關帳）：授權後請款；Action=N 放棄（取消授權）：請款前取消，不支援部分取消。
  *  - 僅信用卡類付款方式可呼叫；ATM/CVS/BARCODE/WebATM/ApplePay 由呼叫端先擋下（見 EcpayPaymentType）。
  *
- * MOCK 模式（API_MODE=mock）回固定 fixture（`1|OK`），不打真 API（DoAction 連 Stage 都不可用）。
+ * ⚠️ 回應解析（Issue #20）：正式環境回應不含 `|`，過去以 pipe 切割導致「綠界端已成功、WC 判定失敗」
+ * 並刪除 refund，站方若再退一次即重複退款。現以 parse_str 解析；缺 RtnCode（空字串 / HTML 錯誤頁 /
+ * 格式無法解析）一律 fail-closed（throw），並於 order note 提醒站方至綠界廠商後台確認實際狀態、勿重複操作。
+ *
+ * MOCK 模式（API_MODE=mock）不打真 API（DoAction 連 Stage 都不可用），改以與正式環境相同格式的
+ * fixture（`...&RtnCode=1&RtnMsg=Succeeded.`）走同一個 parse_response()，確保 mock 測試也覆蓋解析路徑。
  *
  * @see https://developers.ecpay.com.tw/?p=2901 §信用卡請退款功能
  * @see ECPay-API-Skill guides/01-payment-aio.md §信用卡請款 / 退款 / 取消（Action C/N/R/E 對照表）
+ * @see ECPay-API-Skill guides/19-http-protocol-reference.md §回應格式對照表（/CreditDetail/DoAction → URL-encoded）
  */
 
 declare(strict_types=1);
@@ -36,6 +43,12 @@ final class DoActionClient {
 	/** @var string DoAction 正式環境端點（Stage 不支援 DoAction） */
 	private const ENDPOINT_PROD = 'https://payment.ecpay.com.tw/CreditDetail/DoAction';
 
+	/** @var string 失敗 / 結果未知時給站方的處置提醒（避免重複退款 / 重複請款） */
+	private const VERIFY_HINT = '請至綠界廠商後台確認實際狀態，勿重複操作';
+
+	/** @var int 寫入 log 的原始回應 body 最大字元數 */
+	private const LOG_BODY_MAX_LENGTH = 500;
+
 	/** @var AioSettingsDTO 設定 */
 	private readonly AioSettingsDTO $settings;
 
@@ -54,7 +67,7 @@ final class DoActionClient {
 	 * @param float  $amount   欲退款金額（來自 WC refund 物件，非前端）
 	 *
 	 * @return array{RtnCode: string, RtnMsg: string} DoAction 回應（RtnCode='1' 為成功）
-	 * @throws \Exception 連線失敗 / 缺 TradeNo / RtnCode 非 1
+	 * @throws \Exception 連線失敗 / 缺 TradeNo / 回應無法解析 / RtnCode 非 1
 	 */
 	public function refund( string $trade_no, float $amount ): array {
 		return $this->do_action( 'R', $trade_no, $amount, '退款' );
@@ -69,7 +82,7 @@ final class DoActionClient {
 	 * @param float  $amount   欲請款金額
 	 *
 	 * @return array{RtnCode: string, RtnMsg: string} DoAction 回應（RtnCode='1' 為成功）
-	 * @throws \Exception 連線失敗 / 缺 TradeNo / RtnCode 非 1
+	 * @throws \Exception 連線失敗 / 缺 TradeNo / 回應無法解析 / RtnCode 非 1
 	 */
 	public function capture( string $trade_no, float $amount ): array {
 		return $this->do_action( 'C', $trade_no, $amount, '請款' );
@@ -84,7 +97,7 @@ final class DoActionClient {
 	 * @param float  $amount   原授權金額
 	 *
 	 * @return array{RtnCode: string, RtnMsg: string} DoAction 回應（RtnCode='1' 為成功）
-	 * @throws \Exception 連線失敗 / 缺 TradeNo / RtnCode 非 1
+	 * @throws \Exception 連線失敗 / 缺 TradeNo / 回應無法解析 / RtnCode 非 1
 	 */
 	public function cancel_auth( string $trade_no, float $amount ): array {
 		return $this->do_action( 'N', $trade_no, $amount, '取消授權' );
@@ -99,7 +112,7 @@ final class DoActionClient {
 	 * @param string $action_zh 動作中文（order note 用：請款 / 取消授權 / 退款）
 	 *
 	 * @return array{RtnCode: string, RtnMsg: string}
-	 * @throws \Exception 缺 TradeNo / 連線失敗 / RtnCode 非 1
+	 * @throws \Exception 缺 TradeNo / 連線失敗 / 回應無法解析 / RtnCode 非 1
 	 */
 	private function do_action( string $action, string $trade_no, float $amount, string $action_zh ): array {
 		$merchant_trade_no = ( new EcpayMetaKeys( $this->order ) )->get_trade_no();
@@ -129,17 +142,32 @@ final class DoActionClient {
 			'sha256'
 		);
 
-		// MOCK 模式：不打真 API（DoAction 連 Stage 都不可用），回固定 fixture
-		if ( self::is_mock() ) {
-			return [
-				'RtnCode' => '1',
-				'RtnMsg'  => 'OK',
-			];
-		}
+		// MOCK 模式：不打真 API（DoAction 連 Stage 都不可用），以正式環境相同格式的 fixture 走同一解析路徑
+		$response_body = self::is_mock()
+		? self::build_mock_response_body( $params )
+		: $this->request( $params, $action_zh );
 
-		$response_body = $this->request( $params, $action_zh );
+		return $this->parse_response( $response_body, $action_zh );
+	}
 
-		return $this->parse_response( $response_body );
+	/**
+	 * 組 MOCK 成功回應 body（與正式環境 DoAction 回應同為 URL-encoded 字串）
+	 *
+	 * @param array<string, string|int> $params 請求參數
+	 *
+	 * @return string 例：`MerchantID=...&Merchant=...&MerchantTradeNo=...&TradeNo=...&RtnCode=1&RtnMsg=Succeeded.`
+	 */
+	private static function build_mock_response_body( array $params ): string {
+		return \http_build_query(
+			[
+				'MerchantID'      => (string) ( $params['MerchantID'] ?? '' ),
+				'Merchant'        => (string) ( $params['MerchantID'] ?? '' ),
+				'MerchantTradeNo' => (string) ( $params['MerchantTradeNo'] ?? '' ),
+				'TradeNo'         => (string) ( $params['TradeNo'] ?? '' ),
+				'RtnCode'         => '1',
+				'RtnMsg'          => 'Succeeded.',
+			]
+		);
 	}
 
 	/**
@@ -148,7 +176,7 @@ final class DoActionClient {
 	 * @param array<string, string|int> $params    請求參數（含 CheckMacValue）
 	 * @param string                    $action_zh 動作中文（log 用）
 	 *
-	 * @return string 原始回應 body（pipe-separated `RtnCode|RtnMsg`）
+	 * @return string 原始回應 body（URL-encoded 字串 `key=value&...`）
 	 * @throws \Exception 連線失敗
 	 */
 	private function request( array $params, string $action_zh = '退款' ): string {
@@ -177,22 +205,43 @@ final class DoActionClient {
 	}
 
 	/**
-	 * 解析 DoAction 回應（pipe-separated `RtnCode|RtnMsg`）
+	 * 解析 DoAction 回應（URL-encoded 字串，以 `&` / `=` 解析為 key-value）
 	 *
-	 * 拆為獨立方法以利測試（不需真 HTTP）。RtnCode='1' 為成功，其餘 throw。
+	 * 綠界正式環境回應範例：`MerchantID=...&Merchant=...&MerchantTradeNo=...&TradeNo=...&RtnCode=1&RtnMsg=Succeeded.`。
+	 * 拆為獨立方法以利測試（不需真 HTTP）。判定規則（fail-closed）：
+	 *  - 無 RtnCode 鍵或非字串（空字串 / HTML 錯誤頁 / 舊 pipe 格式等無法解析）→ throw「回應無法解析」，
+	 *    綠界端實際結果未知，order note 提醒站方至綠界廠商後台確認、勿重複操作；原始 body 僅截斷寫入 log。
+	 *  - RtnCode 非 '1' → throw「失敗 RtnCode=...」，同樣附勿重複操作提醒。
+	 *  - RtnCode = '1' → 成功。
 	 *
-	 * @param string $body 原始回應 body
+	 * @param string $body      原始回應 body
+	 * @param string $action_zh 動作中文（訊息用：請款 / 取消授權 / 退款；空字串則不帶）
 	 *
 	 * @return array{RtnCode: string, RtnMsg: string}
-	 * @throws \Exception RtnCode 非 1
+	 * @throws \Exception 回應無法解析 / RtnCode 非 1
 	 */
-	public function parse_response( string $body ): array {
-		$parts    = \explode( '|', \trim( $body ), 2 );
-		$rtn_code = $parts[0];
-		$rtn_msg  = $parts[1] ?? '';
+	public function parse_response( string $body, string $action_zh = '' ): array {
+		$trimmed_body = \trim( $body );
+		$response     = [];
+		\parse_str( $trimmed_body, $response );
 
+		$label    = '' === $action_zh ? '綠界 AIO DoAction ' : "綠界 AIO DoAction {$action_zh}";
+		$rtn_code = $response['RtnCode'] ?? null;
+		$rtn_msg  = $response['RtnMsg'] ?? '';
+		$rtn_msg  = \is_string( $rtn_msg ) ? $rtn_msg : '';
+
+		// 無 RtnCode（或被陣列語法注入成非字串）→ 回應無法解析，綠界端實際結果未知，fail-closed
+		if ( ! \is_string( $rtn_code ) ) {
+			$this->log_unexpected_response( "{$label}回應無法解析（缺少 RtnCode）", $trimmed_body );
+			$msg = "{$label}回應無法解析（缺少 RtnCode），綠界端實際結果未知，" . self::VERIFY_HINT;
+			$this->order->add_order_note( "❌ {$msg}" );
+			throw new \Exception( $msg );
+		}
+
+		$rtn_code = \trim( $rtn_code );
 		if ( '1' !== $rtn_code ) {
-			$msg = "綠界 AIO DoAction 失敗 RtnCode={$rtn_code}：{$rtn_msg}";
+			$this->log_unexpected_response( "{$label}失敗 RtnCode={$rtn_code}", $trimmed_body );
+			$msg = "{$label}失敗 RtnCode={$rtn_code}：{$rtn_msg}。" . self::VERIFY_HINT;
 			$this->order->add_order_note( "❌ {$msg}" );
 			throw new \Exception( $msg );
 		}
@@ -201,6 +250,22 @@ final class DoActionClient {
 			'RtnCode' => $rtn_code,
 			'RtnMsg'  => $rtn_msg,
 		];
+	}
+
+	/**
+	 * 將非預期回應寫入 log（原始 body 截斷，不寫進 order note）
+	 *
+	 * @param string $message      log 訊息
+	 * @param string $trimmed_body 已 trim 的原始回應 body
+	 *
+	 * @return void
+	 */
+	private function log_unexpected_response( string $message, string $trimmed_body ): void {
+		Plugin::logger(
+			"{$message} #{$this->order->get_id()}",
+			'error',
+			[ 'body' => \mb_substr( $trimmed_body, 0, self::LOG_BODY_MAX_LENGTH, 'UTF-8' ) ]
+		);
 	}
 
 	/** @return string DoAction 端點（一律正式環境，Stage 不支援） */

@@ -5,10 +5,11 @@
  * 對應任務：B4a 綠界 AIO 進階金流 — 請款 / 取消授權。
  *
  * API 出處（ECPay-API-Skill guides/01-payment-aio.md §信用卡請款 / 退款 / 取消，2026-06）：
- *  - DoAction 端點 /CreditDetail/DoAction，回應 pipe-separated `RtnCode|RtnMsg`
+ *  - DoAction 端點 /CreditDetail/DoAction，回應為 URL-encoded 字串（`key=value&...`，Issue #20）
  *  - Action=C 請款（關帳）、Action=N 放棄（取消請款 / 取消授權）、Action=E 取消關帳、Action=R 退款
  *  - TradeNo 必須是綠界回傳的交易編號（存於 _pc_ecpay_payment_detail），非 MerchantTradeNo
- *  - DoAction 僅正式環境可用，故 MOCK 攔截回 `1|OK`
+ *  - DoAction 僅正式環境可用，故 MOCK 攔截：組出真實格式 fixture（`...&RtnCode=1&RtnMsg=Succeeded.`）
+ *    並走與正式環境相同的 parse_response 解析
  *
  * 語意：授權後請款(C)；請款前取消授權(N)。
  */
@@ -105,9 +106,9 @@ final class EcpayAioCaptureCancelTest extends TestCase {
 		// When: 請款（Action=C），金額為授權全額
 		$result = $client->capture( '2026060512345678', 1000 );
 
-		// Then: RtnCode=1
+		// Then: RtnCode=1（MOCK fixture 為真實 URL-encoded 格式，經 parse_response 解析）
 		$this->assertSame( '1', $result['RtnCode'] );
-		$this->assertSame( 'OK', $result['RtnMsg'] );
+		$this->assertSame( 'Succeeded.', $result['RtnMsg'] );
 	}
 
 	/**
@@ -142,13 +143,17 @@ final class EcpayAioCaptureCancelTest extends TestCase {
 		$order  = $this->create_credit_order();
 		$client = new DoActionClient( $order );
 
-		// When / Then
+		// When / Then：真實 URL-encoded 格式，RtnMsg 為 URL-encoded「不存在」
 		try {
-			$client->parse_response( '10200047|不存在' );
+			$client->parse_response(
+				"MerchantID=3002607&MerchantTradeNo=MTN{$order->get_id()}&TradeNo=2026060512345678&RtnCode=10200047&RtnMsg=%E4%B8%8D%E5%AD%98%E5%9C%A8"
+			);
 			$this->fail( '預期 RtnCode 非 1 應拋例外' );
 		} catch ( \Throwable $e ) {
 			$this->assertStringContainsString( '10200047', $e->getMessage() );
+			$this->assertStringContainsString( '不存在', $e->getMessage() );
 		}
+		$this->assert_order_note_contains( wc_get_order( $order->get_id() ), '勿重複操作' );
 	}
 
 	// ========== 取消授權 Cancel-Auth（Action=N） ==========
@@ -167,9 +172,9 @@ final class EcpayAioCaptureCancelTest extends TestCase {
 		// When: 取消授權（Action=N），金額為原授權全額
 		$result = $client->cancel_auth( '2026060512345678', 1000 );
 
-		// Then: RtnCode=1
+		// Then: RtnCode=1（MOCK fixture 為真實 URL-encoded 格式，經 parse_response 解析）
 		$this->assertSame( '1', $result['RtnCode'] );
-		$this->assertSame( 'OK', $result['RtnMsg'] );
+		$this->assertSame( 'Succeeded.', $result['RtnMsg'] );
 	}
 
 	// ========== 後台訂單操作 woocommerce_order_actions ==========
