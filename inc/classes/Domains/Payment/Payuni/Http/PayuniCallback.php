@@ -103,7 +103,7 @@ final class PayuniCallback extends ApiBase {
 	 *  4. HashInfo timing-safe 驗章（verify_hash 內含 hash_equals）→ 失敗 log + return。
 	 *  5. AES-256-GCM 解密 → 解密失敗 throw（呼叫端 catch 仍回 200）。
 	 *  6. 以 MerTradeNo 反查訂單 → 查無 log + return。
-	 *  7. 冪等：已 processing → skip。
+	 *  7. 冪等：已付款、終態或相同 TradeNo → skip。
 	 *  8. StatusManager::update_order_status()。
 	 *
 	 * @param array<string, mixed> $params 外層 Form POST body（含 Status / MerID / EncryptInfo / HashInfo）
@@ -159,8 +159,11 @@ final class PayuniCallback extends ApiBase {
 			return;
 		}
 
-		// 7. 冪等：已 processing 則 skip（PAYUNi 重送通知不重複處理）
-		if ( $order->has_status( OrderStatus::PROCESSING->value ) ) {
+		// 7. 已付款、終態或相同 TradeNo 不再處理
+		$trade_no = (string) ( $inner['TradeNo'] ?? '' );
+		if ( $order->is_paid()
+			|| $order->has_status( [ OrderStatus::COMPLETED->value, OrderStatus::REFUNDED->value, OrderStatus::CANCELLED->value ] )
+			|| ( '' !== $trade_no && $trade_no === (string) $order->get_transaction_id() ) ) {
 			return;
 		}
 
