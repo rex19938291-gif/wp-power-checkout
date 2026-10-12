@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Helpers;
 
 /**
- * 綠界 AIO 專用 Order Meta Key 存取
+ * 綠界 AIO / ECPG 共用 Order Meta Key 存取
  *
  * 設計比照 Shared\Helpers\MetaKeys，但綠界有專屬的冪等鍵（MerchantTradeNo）與
  * 取號資訊（ATM/CVS/BARCODE），語意與 SLP 不同，故獨立一個 helper 避免污染共用 MetaKeys。
@@ -14,15 +14,14 @@ namespace J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Helpers;
 final class EcpayMetaKeys {
 
 	/**
-	 * @var string 綠界 MerchantTradeNo（AIO：最近一次送出的編號；付款成功後改寫為實際付款成功的編號）
+	 * @var string 綠界 MerchantTradeNo（AIO / ECPG 共用：最近一次送出的編號；付款成功後改寫為實際付款成功的編號）
 	 *
 	 * DoAction（退款 / 請款 / 取消授權）與 QueryTradeInfo 皆以此值當 MerchantTradeNo。
-	 * ECPG 亦共用此 key（一張訂單一個編號，不輪替）。
 	 */
 	private const TRADE_NO_KEY = '_pc_ecpay_trade_no';
 
 	/**
-	 * @var string AIO 送出過的全部 MerchantTradeNo（每個編號一筆 meta row，非序列化陣列）
+	 * @var string AIO / ECPG 送出過的全部 MerchantTradeNo（每個編號一筆 meta row，非序列化陣列）
 	 *
 	 * 綠界同一 MerchantTradeNo 不可重送，顧客重試付款時每次都換新編號；舊編號的取號 / 繳費仍可能晚到
 	 * （例：先拿 ATM 帳號、改刷卡未付、再用 ATM 帳號繳費），故全部保留供 callback 反查。
@@ -70,7 +69,7 @@ final class EcpayMetaKeys {
 	}
 
 	/**
-	 * @return array<int, string> AIO 送出過的全部 MerchantTradeNo（依送出順序，不含升級前未入歷史的舊編號）
+	 * @return array<int, string> AIO / ECPG 送出過的全部 MerchantTradeNo（依送出順序，不含升級前未入歷史的舊編號）
 	 */
 	public function get_trade_no_history(): array {
 		$rows = $this->_order->get_meta( self::TRADE_NO_HISTORY_KEY, false );
@@ -103,9 +102,9 @@ final class EcpayMetaKeys {
 	}
 
 	/**
-	 * 開始一次新的導轉付款：寫入新的 MerchantTradeNo 為目前編號、加入歷史、清除待導轉旗標（一次 save）
+	 * 開始一次新的付款嘗試（AIO 導轉 / ECPG 取 token）：寫入新的 MerchantTradeNo 為目前編號、加入歷史、清除待導轉旗標（一次 save）
 	 *
-	 * 升級前（或 ECPG）寫入、尚未入歷史的目前編號會先補進歷史，確保其 callback 仍能反查到本訂單。
+	 * 升級前寫入、尚未入歷史的目前編號會先補進歷史，確保其 callback 仍能反查到本訂單。
 	 *
 	 * @param string $trade_no 本次送往綠界的 MerchantTradeNo
 	 * @return void
@@ -262,7 +261,7 @@ final class EcpayMetaKeys {
 	/**
 	 * 以 MerchantTradeNo 反查訂單
 	 *
-	 * 先比對目前編號（`_pc_ecpay_trade_no`，ECPG 與 AIO 共用），找不到再比對 AIO 送出過的歷史編號，
+	 * 先比對目前編號（`_pc_ecpay_trade_no`，ECPG 與 AIO 共用），找不到再比對送出過的歷史編號，
 	 * 讓顧客重試付款後，舊編號的取號 / 繳費通知仍能對應到同一張訂單。
 	 *
 	 * @param string $trade_no MerchantTradeNo

@@ -76,7 +76,35 @@ final class StatusManager {
 			);
 		}
 
+		if ( OrderStatus::PROCESSING === $order_status ) {
+			$this->record_paid_trade_no();
+		}
+
 		$this->order->update_status( $order_status->value );
+	}
+
+	/**
+	 * 付款成功：把「實際付款成功」的 MerchantTradeNo 寫回 `_pc_ecpay_trade_no`
+	 *
+	 * 每次付款嘗試都換新編號（EcpgApiClient::start_trade_attempt），付款成功的可能不是最近一次的編號
+	 * （例：舊分頁的 3DS 晚完成）。退款 DoAction 以 `_pc_ecpay_trade_no` 當 MerchantTradeNo、TradeNo 取自本次寫入的付款明細，
+	 * 兩者須成對。其他編號仍留在歷史，callback 照樣反查得到。比照 AIO StatusManager::record_paid_trade_no。
+	 *
+	 * @return void
+	 */
+	private function record_paid_trade_no(): void {
+		$order_info    = $this->_payload['OrderInfo'] ?? [];
+		$paid_trade_no = \is_array( $order_info ) ? (string) ( $order_info['MerchantTradeNo'] ?? '' ) : '';
+		if ( '' === $paid_trade_no ) {
+			$paid_trade_no = (string) ( $this->_payload['MerchantTradeNo'] ?? '' );
+		}
+
+		$meta_keys = new EcpayMetaKeys( $this->order );
+		if ( '' === $paid_trade_no || $paid_trade_no === $meta_keys->get_trade_no() ) {
+			return;
+		}
+
+		$meta_keys->settle_trade_no( $paid_trade_no );
 	}
 
 	/**

@@ -75,9 +75,28 @@ final class EcpgApiClient {
 	}
 
 	/**
+	 * 開始一次新的付款嘗試：產生本訂單未用過的 MerchantTradeNo，寫為目前編號並加入歷史
+	 *
+	 * 綠界規格「特店訂單編號均為唯一值，不可重複使用」（https://developers.ecpay.com.tw/9040.md）。
+	 * stage 實測：尚未 CreatePayment 的編號重送 GetTokenbyTrade 可過；但顧客刷卡失敗 / 3DS 中斷後回 order-pay 重付時，
+	 * 該編號已建立過交易，依規格不可再用（AIO 同編號重送 stage 實測回 10300028 訂單編號重覆）。
+	 * 故每次 process_payment 都換新編號；舊編號留在 _pc_ecpay_trade_no_history，遲到的 ReturnURL 仍反查得到本訂單，
+	 * 付款成功時由 StatusManager 把成功的編號寫回 _pc_ecpay_trade_no（退款用）。
+	 *
+	 * @return string 本次送往綠界的 MerchantTradeNo
+	 */
+	private function start_trade_attempt(): string {
+		$meta_keys = new EcpayMetaKeys( $this->order );
+		$trade_no  = TradeNo::encode_unique( $this->order->get_id(), $meta_keys->get_used_trade_nos() );
+		$meta_keys->start_trade_attempt( $trade_no );
+
+		return $trade_no;
+	}
+
+	/**
 	 * 呼叫 GetTokenbyTrade 取得交易 token
 	 *
-	 * 流程：組裝 Data（含 ConsumerInfo Email/Phone）→ 寫入冪等鍵 MerchantTradeNo →
+	 * 流程：每次付款嘗試產生新的 MerchantTradeNo（{@see self::start_trade_attempt()}）→ 組裝 Data（含 ConsumerInfo Email/Phone）→
 	 * AES 加密送 ecpg domain → 雙層檢查（TransCode → RtnCode）→ 回傳解密後 Data（含 Token）。
 	 *
 	 * ConsumerInfo 缺 Email/Phone 時 GetTokenParams::validate() 會 throw。
@@ -86,14 +105,7 @@ final class EcpgApiClient {
 	 * @throws \Exception 取 token 失敗（傳輸層 / 業務層 / ConsumerInfo 缺漏）
 	 */
 	public function get_token(): array {
-		$meta_keys = new EcpayMetaKeys( $this->order );
-
-		// 冪等：沿用既有 MerchantTradeNo（重試取 token 不重新編號），首次則生成並寫入
-		$trade_no = $meta_keys->get_trade_no();
-		if ('' === $trade_no) {
-			$trade_no = TradeNo::encode( $this->order->get_id() );
-			$meta_keys->update_trade_no( $trade_no );
-		}
+		$trade_no = $this->start_trade_attempt();
 
 		$params = $this->build_get_token_params( $trade_no, EcpayPaymentMethod::CREDIT );
 
@@ -127,7 +139,7 @@ final class EcpgApiClient {
 	 *      BARCODE：BarcodeInfo{Barcode1, Barcode2, Barcode3, ExpireDate}
 	 *    RtnCode=1 代表「取號成功」（非付款成功）；訂單應維持待付款，待消費者實際繳費後 ReturnURL 才轉付款完成。
 	 *
-	 * 冪等：沿用既有 MerchantTradeNo（重試取號不重新編號），首次則生成並寫入。
+	 * 每次取號都是新的付款嘗試：產生新的 MerchantTradeNo（{@see self::start_trade_attempt()}，已取號的舊編號不可重送）。
 	 *
 	 * @param EcpayPaymentMethod $payment 付款方式（限 ATM / CVS / BARCODE）
 	 *
@@ -141,14 +153,7 @@ final class EcpgApiClient {
 			throw new \Exception( "綠界站內付幕後取號不支援付款方式：{$payment->value}" );
 		}
 
-		$meta_keys = new EcpayMetaKeys( $this->order );
-
-		// 冪等：沿用既有 MerchantTradeNo，首次則生成並寫入
-		$trade_no = $meta_keys->get_trade_no();
-		if ( '' === $trade_no ) {
-			$trade_no = TradeNo::encode( $this->order->get_id() );
-			$meta_keys->update_trade_no( $trade_no );
-		}
+		$trade_no = $this->start_trade_attempt();
 
 		// 步驟 1：GetTokenbyTrade（帶非信用卡 ChoosePaymentList + 對應 Info）取得 Token
 		$params = $this->build_get_token_params( $trade_no, $payment );

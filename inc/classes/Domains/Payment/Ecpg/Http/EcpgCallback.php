@@ -8,7 +8,8 @@
  *  - ReturnURL 為 Server-to-Server JSON POST（Content-Type: application/json）。
  *  - 外層為三層結構 { MerchantID, RpHeader, TransCode, TransMsg, Data }，Data 為 AES-128-CBC 密文。
  *  - 雙層錯誤檢查：TransCode（整數，傳輸層）=== 1 → 解密 Data → RtnCode（整數，業務層）。
- *  - 冪等：以 MerchantTradeNo 為 key，已 processing 則 skip。
+ *  - 以 MerchantTradeNo 反查訂單（含重試付款留下的歷史編號）；冪等：已入帳（已付款 / 已退款）則 skip，
+ *    另一編號的付款成功只加註「疑似重複付款」。
  *  - AES 解密失敗 → 維持 pending，不更新明細，僅 log（仍回 1|OK 避免綠界重送風暴）。
  *  - 回應必須是純文字 `1|OK`，HTTP 200（非 JSON）。
  *
@@ -143,12 +144,53 @@ final class EcpgCallback extends ApiBase {
 			throw new \Exception( "找不到訂單，MerchantTradeNo: {$trade_no}" );
 		}
 
-		// 冪等：已轉為 processing（已付款）則不重複處理
-		if ( $order->has_status( OrderStatus::PROCESSING->value ) ) {
+		// 冪等：已入帳則不重複處理（重送不重複入帳；另一編號的付款成功則加註重複付款）
+		if ( self::is_settled( $order ) ) {
+			self::note_duplicate_payment( $order, $decrypted, $trade_no );
 			return;
 		}
 
 		( new StatusManager( $decrypted, $order ) )->update_order_status();
+	}
+
+	/**
+	 * 訂單是否已入帳（不得再由付款通知改寫狀態 / 明細）
+	 *
+	 * 已付款（processing / completed，即 is_paid）或已全額退款（refunded）。舊版只擋 processing，
+	 * completed / refunded 訂單收到重送的成功通知會被改回 processing。比照 AioCallback::is_settled。
+	 *
+	 * @param \WC_Order $order 訂單
+	 * @return bool
+	 */
+	private static function is_settled( \WC_Order $order ): bool {
+		return $order->is_paid() || $order->has_status( OrderStatus::REFUNDED->value );
+	}
+
+	/**
+	 * 已入帳訂單又收到「另一個 MerchantTradeNo」的付款成功通知 → 加註重複付款警告（不改狀態 / 明細）
+	 *
+	 * 情境：每次付款嘗試都換新編號，顧客在兩個分頁各刷一次卡，兩筆都成功。第二筆是真實扣款，
+	 * 不能默默吞掉，須讓站方看到並至綠界後台核對 / 人工退款。同編號重送（即已記錄的付款編號）→ 正常冪等，不加註。
+	 *
+	 * @param \WC_Order            $order     訂單
+	 * @param array<string, mixed> $decrypted ReturnURL 解密後的 Data
+	 * @param string               $trade_no  通知的 MerchantTradeNo
+	 * @return void
+	 */
+	private static function note_duplicate_payment( \WC_Order $order, array $decrypted, string $trade_no ): void {
+		$settled = ( new EcpayMetaKeys( $order ) )->get_trade_no();
+		if ( 1 !== (int) ( $decrypted['RtnCode'] ?? 0 ) || $trade_no === $settled ) {
+			return;
+		}
+
+		$order->add_order_note(
+			\sprintf(
+				/* translators: 1: 本次通知的 MerchantTradeNo, 2: 訂單已記錄的付款編號 */
+				\__( '⚠️ 疑似重複付款：此訂單已入帳（付款編號 %2$s），又收到 MerchantTradeNo %1$s 的綠界站內付付款成功通知。訂單狀態與付款明細未變更，請至綠界廠商後台核對，必要時人工退款。', 'power_checkout' ),
+				$trade_no,
+				'' !== $settled ? $settled : '-'
+			)
+		);
 	}
 
 	// endregion

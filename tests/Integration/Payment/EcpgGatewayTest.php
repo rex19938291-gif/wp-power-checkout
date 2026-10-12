@@ -2,7 +2,7 @@
 /**
  * 綠界站內付 2.0（ECPG）Gateway / ApiClient 整合測試
  * 驗證：ConsumerInfo 缺 Email→失敗、雙層錯誤檢查（TransCode→RtnCode）、
- * ThreeDURL 空/非空分流、MerchantTradeNo 冪等寫入。
+ * ThreeDURL 空/非空分流、每次付款嘗試換新 MerchantTradeNo（舊編號留歷史）。
  *
  * 真 API 呼叫以 API_MODE=mock 攔截（不打綠界）；雙層錯誤檢查以 parse_response()
  * 搭配真 AES 加密 Data 直接驗證，不需 HTTP。
@@ -292,7 +292,7 @@ final class EcpgGatewayTest extends TestCase {
 		);
 	}
 
-	// ========== MerchantTradeNo 冪等寫入 ==========
+	// ========== MerchantTradeNo 寫入（每次付款嘗試一個新編號） ==========
 
 	/**
 	 * @test
@@ -317,22 +317,57 @@ final class EcpgGatewayTest extends TestCase {
 	}
 
 	/**
+	 * 重試付款（order-pay / block 結帳沿用同一張單）再取 token → 換新 MerchantTradeNo，舊編號留在歷史
+	 *
+	 * 綠界規格：特店訂單編號均為唯一值，不可重複使用。第一次 CreatePayment 失敗 / 3DS 中斷後，
+	 * 舊編號已建立過交易，重送會被拒；舊編號仍須能讓遲到的 ReturnURL 反查到本訂單。
+	 *
 	 * @test
 	 * @group edge
 	 */
-	public function test_重複get_token時沿用同一MerchantTradeNo(): void {
-		// Given: MOCK 模式，已寫入 trade_no
+	public function test_重複get_token時每次換新MerchantTradeNo且舊編號留在歷史(): void {
+		// Given: MOCK 模式
 		putenv( 'API_MODE=mock' );
 		$order = $this->create_ecpg_order();
 
-		// When: 連續呼叫兩次 get_token
+		// When: 連續兩次付款嘗試（同一秒內也不得撞號）
 		( new EcpgApiClient( $order ) )->get_token();
-		$first = ( new EcpayMetaKeys( wc_get_order( $order->get_id() ) ) )->get_trade_no();
-		( new EcpgApiClient( wc_get_order( $order->get_id() ) ) )->get_token();
-		$second = ( new EcpayMetaKeys( wc_get_order( $order->get_id() ) ) )->get_trade_no();
+		$first     = ( new EcpayMetaKeys( wc_get_order( $order->get_id() ) ) )->get_trade_no();
+		$decrypted = ( new EcpgApiClient( wc_get_order( $order->get_id() ) ) )->get_token();
+		$meta_keys = new EcpayMetaKeys( wc_get_order( $order->get_id() ) );
+		$second    = $meta_keys->get_trade_no();
 
-		// Then: 冪等，trade_no 不變
-		$this->assertSame( $first, $second );
+		// Then: 第二次是新編號、Token 對應新編號、兩個編號都在歷史且都反查得到本訂單
+		$this->assertNotSame( '', $first );
+		$this->assertNotSame( $first, $second );
+		$this->assertStringContainsString( $second, (string) $decrypted['Token'] );
+		$this->assertSame( [ $first, $second ], $meta_keys->get_trade_no_history() );
+		$this->assertSame( $order->get_id(), EcpayMetaKeys::get_order_by_trade_no( $first )?->get_id() );
+		$this->assertSame( $order->get_id(), EcpayMetaKeys::get_order_by_trade_no( $second )?->get_id() );
+
+		putenv( 'API_MODE=mock' );
+	}
+
+	/**
+	 * 升級前（沿用編號時代）已有 _pc_ecpay_trade_no 但無歷史 → 重試時舊編號補進歷史，不得遺失
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_升級前既有編號在重試取token時補進歷史(): void {
+		// Given: 舊版寫入的編號（無歷史）
+		putenv( 'API_MODE=mock' );
+		$order = $this->create_ecpg_order();
+		( new EcpayMetaKeys( $order ) )->update_trade_no( 'LEGACY' . $order->get_id() );
+
+		// When
+		( new EcpgApiClient( wc_get_order( $order->get_id() ) ) )->get_token();
+
+		// Then: 新編號為目前編號，舊編號在歷史
+		$meta_keys = new EcpayMetaKeys( wc_get_order( $order->get_id() ) );
+		$this->assertNotSame( 'LEGACY' . $order->get_id(), $meta_keys->get_trade_no() );
+		$this->assertContains( 'LEGACY' . $order->get_id(), $meta_keys->get_trade_no_history() );
+		$this->assertSame( $order->get_id(), EcpayMetaKeys::get_order_by_trade_no( 'LEGACY' . $order->get_id() )?->get_id() );
 
 		putenv( 'API_MODE=mock' );
 	}

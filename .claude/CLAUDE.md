@@ -332,17 +332,30 @@ ECPay callbacks use `permission_callback: __return_true`; auth is verified insid
 
 | Payment Method | API Refund |
 |---|---|
-| Credit Card (one-time/installment/period) | Yes — DoAction Action=R (prod-only); response is URL-encoded (`parse_str`), not `RtnCode\|RtnMsg`; on failure: full-refund status rolled back to processing + `record_refund_error()` |
+| Credit Card (one-time/installment/period) | Yes — DoAction Action=R (prod-only); response is URL-encoded (`parse_str`), not `RtnCode\|RtnMsg`; on failure: `fail_gateway_refund()` (see Refund Failure Handling) |
 | ATM / WebATM / CVS / BARCODE / ApplePay | No — manual via ECPay admin |
 
 ### ECPG Embedded (ecpay_ecpg)
 
-1. `before_process_payment()` → `EcpgApiClient::get_token()` (GetTokenbyTrade) → token stored in `_pc_ecpay_ecpg_token`, returns order-received URL
+1. `before_process_payment()` → `EcpgApiClient::get_token()` (GetTokenbyTrade) → token stored in `_pc_ecpay_ecpg_token`, returns order-received URL. **Every payment attempt gets a new MerchantTradeNo** (`TradeNo::encode_unique()` + `_pc_ecpay_trade_no_history`, shared with AIO): spec says「特店訂單編號均為唯一值，不可重複使用」— stage accepts re-sending GetTokenbyTrade for a number never used in CreatePayment, but a number that went through CreatePayment (card declined / 3DS abandoned) cannot be reused on retry (order-pay / block checkout reuse the same order)
 2. Frontend `MountEcpgPayment()` loads ECPay JS SDK, renders embedded card form (container `#ECPayPayment`), customer enters card details → SDK returns PayToken
-3. Frontend POSTs PayToken to `/wp-json/power-checkout/ecpay/ecpg/create-payment` (auth: order_key)
+3. Frontend POSTs PayToken to `/wp-json/power-checkout/ecpay/ecpg/create-payment` (auth: order_key); orders that no longer `needs_payment()` → 400 (no second charge from a stale tab)
 4. Backend calls `EcpgApiClient::create_payment()` → if `ThreeDInfo.ThreeDURL` non-empty, returns `three_d_url` → frontend redirects to 3DS; otherwise waits for ReturnURL
-5. ECPay sends JSON POST to `/wp-json/power-checkout/ecpay/ecpg/return` — AES-128-CBC decrypted, TransCode + RtnCode double-checked
-6. Refund: credit card only → DoAction via ecpayment domain; non-credit returns `WP_Error('refund_unsupported')`
+5. ECPay sends JSON POST to `/wp-json/power-checkout/ecpay/ecpg/return` — AES-128-CBC decrypted, TransCode + RtnCode double-checked; order lookup matches current trade no **and** history; already-paid/refunded orders are not re-settled (a different paid number only adds a「疑似重複付款」note); success writes the **settled** MerchantTradeNo back to `_pc_ecpay_trade_no` (refund DoAction pairs it with the detail's TradeNo)
+6. Refund: credit card only → DoAction via ecpayment domain; non-credit returns `WP_Error('refund_unsupported')`; on failure: `fail_gateway_refund()`
+
+---
+
+## Refund Failure Handling (all gateways)
+
+Gateway refunds are sent in `process_gateway_refund()` on `woocommerce_order_refunded` — **after** `wc_create_refund()` has already flipped a full refund to `refunded`. Every gateway's catch block (SLP / AIO / ECPG / NewebPay MPG / PAYUNi UPP / UNi Embed / PayNow) calls `AbstractPaymentGateway::fail_gateway_refund()`:
+
+1. order note `❌ {gateway} 退款失敗：{reason}`
+2. delete the WC refund (no money moved → no refund record)
+3. full refund: roll the order back to its **pre-refund status** (remembered by `remember_status_before_refund` on `woocommerce_order_status_changed`; fallback `processing`)
+4. `record_refund_error()` → `_pc_refund_error` meta (read-once) → REST `/refund` returns it via `consume_refund_error()` (error_code + raw_code + message)
+
+PayNow ATM refund with missing bank fields is treated as a failure (`ErrorCode::VALIDATION`) so the admin can fill them in and retry.
 
 ---
 
@@ -359,7 +372,7 @@ Refund support by payment method (determined by PAYUNi `PaymentType` in `_pc_pay
 
 | Payment Method | API Refund |
 |---|---|
-| Credit Card (PaymentType=1) | Yes — Close CloseType=2 (`/api/trade/close`); wpdb TRANSACTION + ROLLBACK on failure |
+| Credit Card (PaymentType=1) | Yes — Close CloseType=2 (`/api/trade/close`); wpdb TRANSACTION + ROLLBACK + `fail_gateway_refund()` on failure |
 | ATM / CVS / icash / LINE Pay / JKoPay / etc. | No — `WP_Error('refund_unsupported')`, manual via PAYUNi admin |
 
 Admin order actions (credit card only):
@@ -391,7 +404,7 @@ Refund support (determined by `PaymentType` in `_pc_payuni_uni_payment_detail`):
 
 | Payment Method | API Refund |
 |---|---|
-| Credit Card (PaymentType=1) | Yes — Close CloseType=2 (`/api/trade/close`); wpdb TRANSACTION + ROLLBACK on failure |
+| Credit Card (PaymentType=1) | Yes — Close CloseType=2 (`/api/trade/close`); wpdb TRANSACTION + ROLLBACK + `fail_gateway_refund()` on failure |
 | Others | No — `WP_Error('refund_unsupported')`, manual via PAYUNi admin |
 
 Admin order actions (credit card only):
@@ -419,7 +432,7 @@ Refund support (determined by `PaymentType` in `_pc_paynow_payment_detail`, not 
 
 | Payment Method | API Refund |
 |---|---|
-| Credit Card (PaymentType=Credit/CreditCardInstallment) | Yes — REST `POST /payment-intents/:id/refunds`; wpdb TRANSACTION + ROLLBACK on failure; writes `_pc_paynow_refund_detail` |
+| Credit Card (PaymentType=Credit/CreditCardInstallment) | Yes — REST `POST /payment-intents/:id/refunds`; wpdb TRANSACTION + ROLLBACK + `fail_gateway_refund()` on failure; writes `_pc_paynow_refund_detail` |
 | ATM | Yes — REST `POST /payment-intents/:id/refunds` (requires bankCode/bankBranchCode/bankAccount); missing bank fields rejected before API call |
 | ConvenienceStore / LINE Pay / Apple Pay | No — `WP_Error('refund_unsupported')`, manual via PayNow admin |
 
@@ -575,8 +588,8 @@ Environment: dev `https://invoiceapi-dev.paynow.com.tw` / prod `https://invoicea
 | `pc_provider_id` | Which invoice provider was used |
 | `pc_issue_params` | Checkout-submitted invoice info |
 | `_pc_tax_type` | Product tax type (for invoicing) |
-| `_pc_ecpay_trade_no` | ECPay MerchantTradeNo — AIO: latest attempt, overwritten with the settled attempt on payment success; ECPG: idempotency guard |
-| `_pc_ecpay_trade_no_history` | AIO: every MerchantTradeNo ever sent for the order (callback lookup fallback; retry payments generate new numbers) |
+| `_pc_ecpay_trade_no` | ECPay MerchantTradeNo — AIO / ECPG: latest attempt, overwritten with the settled attempt on payment success |
+| `_pc_ecpay_trade_no_history` | AIO / ECPG: every MerchantTradeNo ever sent for the order (callback lookup fallback; retry payments generate new numbers) |
 | `_pc_ecpay_redirect_pending` | AIO: `process_payment` ran and the order-received page should auto-redirect to ECPay once |
 | `_pc_ecpay_payment_detail` | ECPay payment result detail (ReturnURL / CreatePayment response) |
 | `_pc_ecpay_payment_info` | ATM/CVS/BARCODE payment info (BankCode, vAccount, PaymentNo, Barcode, ExpireDate) |

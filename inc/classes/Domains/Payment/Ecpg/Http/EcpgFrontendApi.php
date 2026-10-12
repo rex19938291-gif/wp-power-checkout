@@ -68,7 +68,8 @@ final class EcpgFrontendApi extends ApiBase {
 	 *  1. 以 order_id 取訂單；不存在 → 404。
 	 *  2. 比對 order_key 與 $order->get_order_key()（防越權）；不符 → 403。
 	 *  3. 驗證訂單付款方式為 ecpay_ecpg；否則 → 400。
-	 *  4. 取訂單冪等鍵 MerchantTradeNo（GetTokenbyTrade 階段寫入，須與 CreatePayment 相同）。
+	 *  4. 訂單已付款（needs_payment=false）→ 400，不再建立付款（防重複扣款）。
+	 *     取本次付款嘗試的 MerchantTradeNo（GetTokenbyTrade 階段寫入，須與 CreatePayment 相同）。
 	 *  5. 呼叫 EcpgApiClient::create_payment( pay_token, merchant_trade_no )。
 	 *  6. 回 { code:'success', message, data:{ three_d_url, need_3ds } }。
 	 *
@@ -99,6 +100,11 @@ final class EcpgFrontendApi extends ApiBase {
 
 		if ( '' === \trim( $pay_token ) ) {
 			return self::error_response( 'pay_token 必填', 400 );
+		}
+
+		// 已付款訂單不再建立付款（防重複扣款：例如付款成功後，另一個分頁的舊付款表單又送出一次）
+		if ( ! $order->needs_payment() ) {
+			return self::error_response( '此訂單已付款，無需再次付款', 400 );
 		}
 
 		try {
