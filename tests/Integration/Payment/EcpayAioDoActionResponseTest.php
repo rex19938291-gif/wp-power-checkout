@@ -13,6 +13,11 @@
  * 以 pre_http_request 攔截 payment.ecpay.com.tw/CreditDetail/DoAction 回傳真實格式 body，
  * 讓 wc_create_refund → process_refund → woocommerce_order_refunded → DoAction → parse_response 全鏈執行。
  *
+ * 另以同一端到端手法覆蓋「退款失敗透出」（比照藍新 MpgRedirectGateway::process_gateway_refund）：
+ *  - 全額退款失敗時訂單狀態回滾（wc_create_refund 先推 refunded 才觸發 hook，不回滾會殘留 refunded）。
+ *  - record_refund_error 寫入失敗記錄（raw_code = 綠界 RtnCode；回應無法解析時為 null），
+ *    REST /refund 以 consume_refund_error 取回並回應給前端。
+ *
  * @group integration
  * @group payment
  * @group ecpay
@@ -26,6 +31,8 @@ namespace Tests\Integration\Payment;
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\Http\DoActionClient;
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\Services\AioRedirectGateway;
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Helpers\EcpayMetaKeys;
+use J7\PowerCheckout\Domains\Payment\Shared\Services\PaymentApiService;
+use J7\PowerCheckout\Shared\Errors\ErrorCode;
 use J7\PowerCheckout\Shared\Utils\ProviderUtils;
 use Tests\Integration\TestCase;
 
@@ -443,5 +450,171 @@ final class EcpayAioDoActionResponseTest extends TestCase {
 		$this->assertSame( 'captured', ( new EcpayMetaKeys( $fresh ) )->get_capture_status() );
 		$this->assert_order_note_contains( $fresh, '請款成功' );
 		$this->assert_no_failure_note( $order->get_id() );
+	}
+
+	// ========== 退款失敗透出：全額退款狀態回滾 + record_refund_error（比照藍新 MPG） ==========
+
+	/**
+	 * 以 wc_create_refund(refund_payment=true) 走完整退款鏈
+	 *
+	 * @param \WC_Order $order  訂單
+	 * @param float     $amount 退款金額
+	 * @return \WC_Order_Refund|\WP_Error
+	 */
+	private function create_gateway_refund( \WC_Order $order, float $amount ) {
+		WC()->payment_gateways()->init(); // 載入 gateway（註冊 woocommerce_order_refunded handler）
+
+		return \wc_create_refund(
+			[
+				'order_id'       => $order->get_id(),
+				'amount'         => $amount,
+				'reason'         => '退款失敗透出',
+				'refund_payment' => true,
+			]
+		);
+	}
+
+	/**
+	 * 讀取訂單上的退款失敗記錄（AbstractPaymentGateway::REFUND_ERROR_META）
+	 *
+	 * @param int $order_id 訂單 ID
+	 * @return mixed
+	 */
+	private function get_refund_error_meta( int $order_id ): mixed {
+		$fresh = \wc_get_order( $order_id );
+		$this->assertInstanceOf( \WC_Order::class, $fresh );
+		return $fresh->get_meta( '_pc_refund_error' );
+	}
+
+	/**
+	 * 全額退款 API 失敗 → 訂單不得停在 refunded（wc_create_refund 先推 refunded 才觸發 hook）
+	 *
+	 * 修正前：catch 只 ROLLBACK + note + 刪 refund，訂單殘留 refunded 卻無任何退款記錄。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_端到端全額退款失敗時訂單狀態回滾不停在refunded(): void {
+		// Given: 1000 元已付款信用卡訂單；DoAction 回 RtnCode=10100050
+		$order = $this->create_credit_order( 1000 );
+		$this->use_real_http_path(
+			'MerchantID=3002607&MerchantTradeNo=MTN' . $order->get_id() . '&TradeNo=' . self::TRADE_NO . '&RtnCode=10100050&RtnMsg=%E9%80%80%E6%AC%BE%E5%A4%B1%E6%95%97'
+		);
+
+		// When: 全額退款
+		$refund = $this->create_gateway_refund( $order, 1000 );
+
+		// Then: API 確實送出且失敗 → refund 被刪、訂單回滾為 processing（非 refunded）
+		$this->assertInstanceOf( \WC_Order_Refund::class, $refund );
+		$this->assertCount( 1, $this->captured_requests );
+		$fresh = \wc_get_order( $order->get_id() );
+		$this->assertInstanceOf( \WC_Order::class, $fresh );
+		$this->assertCount( 0, $fresh->get_refunds(), '退款失敗不得殘留 refund 記錄' );
+		$this->assertNotSame( 'refunded', $fresh->get_status(), 'API 失敗時訂單不得停在 refunded' );
+		$this->assert_order_status( $order, 'processing' );
+		$this->assert_order_note_contains( $fresh, '訂單狀態回滾' );
+	}
+
+	/**
+	 * 退款 API 失敗 → 訂單 meta 記錄正規化錯誤，raw_code 為綠界 RtnCode
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_端到端退款失敗記錄退款錯誤meta且raw_code為RtnCode(): void {
+		// Given
+		$order = $this->create_credit_order( 1000 );
+		$this->use_real_http_path(
+			'MerchantID=3002607&MerchantTradeNo=MTN' . $order->get_id() . '&TradeNo=' . self::TRADE_NO . '&RtnCode=10100050&RtnMsg=%E9%80%80%E6%AC%BE%E5%A4%B1%E6%95%97'
+		);
+
+		// When
+		$this->create_gateway_refund( $order, 1000 );
+
+		// Then: 失敗記錄存在、error_code=PROVIDER、raw_code=RtnCode、訊息含失敗原因
+		$error = $this->get_refund_error_meta( $order->get_id() );
+		$this->assertIsArray( $error );
+		$this->assertSame( ErrorCode::PROVIDER->value, $error['error_code'] ?? null );
+		$this->assertSame( '10100050', $error['raw_code'] ?? null );
+		$this->assertStringContainsString( 'RtnCode=10100050', (string) ( $error['message'] ?? '' ) );
+		$this->assertStringContainsString( '退款失敗', (string) ( $error['message'] ?? '' ) );
+	}
+
+	/**
+	 * 部分退款 API 失敗 → 訂單狀態維持 processing（本來就不會被推到 refunded），仍記錄失敗原因
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_端到端部分退款失敗時狀態不變且記錄失敗(): void {
+		$order = $this->create_credit_order( 1000 );
+		$this->use_real_http_path(
+			'MerchantID=3002607&MerchantTradeNo=MTN' . $order->get_id() . '&TradeNo=' . self::TRADE_NO . '&RtnCode=10100050&RtnMsg=Failed'
+		);
+
+		$this->create_gateway_refund( $order, 300 );
+
+		$this->assert_order_status( $order, 'processing' );
+		$error = $this->get_refund_error_meta( $order->get_id() );
+		$this->assertIsArray( $error );
+		$this->assertSame( '10100050', $error['raw_code'] ?? null );
+	}
+
+	/**
+	 * 回應無法解析（缺 RtnCode）→ 仍記錄失敗，但 raw_code 為 null（綠界端結果未知）
+	 *
+	 * @test
+	 * @group edge
+	 */
+	public function test_端到端退款回應無法解析時raw_code為null(): void {
+		$order = $this->create_credit_order( 1000 );
+		$this->use_real_http_path( '<html><body>Server Error</body></html>' );
+
+		$this->create_gateway_refund( $order, 1000 );
+
+		$this->assert_order_status( $order, 'processing' );
+		$error = $this->get_refund_error_meta( $order->get_id() );
+		$this->assertIsArray( $error );
+		$this->assertSame( ErrorCode::PROVIDER->value, $error['error_code'] ?? null );
+		$this->assertArrayHasKey( 'raw_code', $error );
+		$this->assertNull( $error['raw_code'] );
+		$this->assertStringContainsString( '回應無法解析', (string) ( $error['message'] ?? '' ) );
+	}
+
+	/**
+	 * REST POST /refund：DoAction 失敗 → 回應帶出 error_code / raw_code / 失敗訊息，且失敗記錄 read-once
+	 *
+	 * 修正前：失敗被 hook 吞掉，REST 回 200「退款成功」。
+	 *
+	 * @test
+	 * @group error
+	 */
+	public function test_REST退款端點失敗時回應帶出RtnCode(): void {
+		// Given
+		$order = $this->create_credit_order( 1000 );
+		$this->use_real_http_path(
+			'MerchantID=3002607&MerchantTradeNo=MTN' . $order->get_id() . '&TradeNo=' . self::TRADE_NO . '&RtnCode=10100050&RtnMsg=%E9%80%80%E6%AC%BE%E5%A4%B1%E6%95%97'
+		);
+		WC()->payment_gateways()->init();
+
+		$request = new \WP_REST_Request( 'POST', '/power-checkout/v1/refund' );
+		$request->set_param( 'order_id', $order->get_id() );
+
+		// When
+		$response = PaymentApiService::instance()->post_refund_callback( $request );
+
+		// Then: 非 200，envelope 帶正規化錯誤與綠界 RtnCode
+		$this->assertSame( ErrorCode::PROVIDER->to_http_status(), $response->get_status() );
+		$data = (array) $response->get_data();
+		$this->assertSame( ErrorCode::PROVIDER->value, $data['error_code'] ?? null );
+		$this->assertSame( '10100050', $data['raw_code'] ?? null );
+		$this->assertStringContainsString( 'RtnCode=10100050', (string) ( $data['message'] ?? '' ) );
+
+		// And: 訂單未殘留 refunded / refund，失敗記錄已被 REST 取走（read-once）
+		$this->assert_order_status( $order, 'processing' );
+		$fresh = \wc_get_order( $order->get_id() );
+		$this->assertInstanceOf( \WC_Order::class, $fresh );
+		$this->assertCount( 0, $fresh->get_refunds() );
+		$this->assertEmpty( $this->get_refund_error_meta( $order->get_id() ) );
 	}
 }

@@ -322,16 +322,17 @@ ECPay callbacks use `permission_callback: __return_true`; auth is verified insid
 
 ### AIO Redirect (ecpay_aio)
 
-1. `before_process_payment()` returns order-received URL (no API call at this stage)
-2. `before_order_received()` assembles `RequestParams` (including CheckMacValue SHA256) and renders auto-submit form → browser POSTs to ECPay Cashier V5
-3. ECPay sends server-to-server POST to `/wp-json/power-checkout/ecpay/aio/return` (ReturnURL) — CheckMacValue verified
-4. ATM/CVS/BARCODE additionally receive `/aio/payment-info` with virtual account / store code / barcode
-5. `StatusManager::update_order_status()` maps RtnCode: `1` → processing, others → pending
-6. Refund support by payment method:
+1. `before_process_payment()` validates the checkout installment field, writes installment meta, marks `_pc_ecpay_redirect_pending`, returns order-received URL (no API call at this stage)
+2. `before_order_received()` (order_key verified + `needs_payment()`) — only when redirect is pending (or no MerchantTradeNo was ever sent): generates a **new** MerchantTradeNo via `TradeNo::encode_unique()` (ECPay MerchantTradeNo is permanently unique — resend → `10300028`), appends it to `_pc_ecpay_trade_no_history`, assembles `RequestParams` (CheckMacValue SHA256) and renders auto-submit form → ECPay Cashier V5. Refresh / back / ClientBackURL do **not** auto-redirect; thank-you page shows a「前往付款」button → order-pay
+3. ECPay sends server-to-server POST to `/wp-json/power-checkout/ecpay/aio/return` (ReturnURL) — CheckMacValue verified; order lookup matches current trade no **and** history (old attempts' ATM/CVS codes still settle)
+4. ATM/CVS/BARCODE additionally receive `/aio/payment-info` with virtual account / store code / barcode (dedup per MerchantTradeNo)
+5. `StatusManager::update_order_status()` maps RtnCode: `1` → processing (writes the **settled** MerchantTradeNo back to `_pc_ecpay_trade_no` so DoAction refund/capture use the paid attempt), others → pending; already-paid/refunded orders are not re-settled, a second paid attempt only adds a「疑似重複付款」note
+6. Installment (`enableInstallment`, default off): ECPay hides one-time payment when `CreditInstallment` is sent, so it is **customer-selected at checkout** (classic `payment_fields()` / blocks `AioBlocksIntegration` + `onPaymentSetup`), not site-wide. Period `30` is sent as `30N` (永豐圓夢彈性分期). Choosing「不分期」clears prior installment meta; `period` variant is a developer/subscription extension point and is never touched
+7. Refund support by payment method:
 
 | Payment Method | API Refund |
 |---|---|
-| Credit Card (one-time/installment/period) | Yes — DoAction Action=R (prod-only) |
+| Credit Card (one-time/installment/period) | Yes — DoAction Action=R (prod-only); response is URL-encoded (`parse_str`), not `RtnCode\|RtnMsg`; on failure: full-refund status rolled back to processing + `record_refund_error()` |
 | ATM / WebATM / CVS / BARCODE / ApplePay | No — manual via ECPay admin |
 
 ### ECPG Embedded (ecpay_ecpg)
@@ -574,7 +575,9 @@ Environment: dev `https://invoiceapi-dev.paynow.com.tw` / prod `https://invoicea
 | `pc_provider_id` | Which invoice provider was used |
 | `pc_issue_params` | Checkout-submitted invoice info |
 | `_pc_tax_type` | Product tax type (for invoicing) |
-| `_pc_ecpay_trade_no` | ECPay MerchantTradeNo (idempotency guard) — AIO + ECPG |
+| `_pc_ecpay_trade_no` | ECPay MerchantTradeNo — AIO: latest attempt, overwritten with the settled attempt on payment success; ECPG: idempotency guard |
+| `_pc_ecpay_trade_no_history` | AIO: every MerchantTradeNo ever sent for the order (callback lookup fallback; retry payments generate new numbers) |
+| `_pc_ecpay_redirect_pending` | AIO: `process_payment` ran and the order-received page should auto-redirect to ECPay once |
 | `_pc_ecpay_payment_detail` | ECPay payment result detail (ReturnURL / CreatePayment response) |
 | `_pc_ecpay_payment_info` | ATM/CVS/BARCODE payment info (BankCode, vAccount, PaymentNo, Barcode, ExpireDate) |
 | `_pc_ecpay_ecpg_token` | ECPG GetTokenbyTrade token (stored for frontend SDK) |

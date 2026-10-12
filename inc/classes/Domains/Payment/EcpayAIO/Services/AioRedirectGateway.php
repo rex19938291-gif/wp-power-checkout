@@ -9,10 +9,11 @@ use J7\PowerCheckout\Domains\Payment\EcpayAIO\DTOs\AioSettingsDTO;
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\DTOs\RequestParams;
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\Http\AioCallback;
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\Http\DoActionClient;
+use J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Helpers\AioBlocksIntegration;
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Helpers\EcpayMetaKeys;
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Helpers\EcpayPaymentType;
+use J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Helpers\TradeNo;
 use J7\PowerCheckout\Domains\Payment\Shared\Abstracts\AbstractPaymentGateway;
-use J7\PowerCheckout\Domains\Payment\Shared\Helpers\BlocksIntegration;
 use J7\PowerCheckout\Domains\Payment\Shared\Interfaces\IGateway;
 use J7\PowerCheckout\Domains\Payment\Shared\Utils\GatewayUtils;
 use J7\PowerCheckout\Plugin;
@@ -47,54 +48,175 @@ final class AioRedirectGateway extends AbstractPaymentGateway implements IGatewa
 	public $method_description = '綠界 ECPay AIO 全方位金流，支援信用卡、ATM、超商代碼、超商條碼、WebATM、Apple Pay 等付款方式';
 
 	/**
+	 * @var array<int, bool> 本次 HTTP 請求對各訂單的導轉嘗試（true = 已輸出導轉表單；false = 嘗試過但建單失敗）
+	 *
+	 * 同請求防重入：每個 gateway 實例都在建構時掛了 wp hook，before_order_received 可能被呼叫多次，
+	 * 有記錄即不再產生第二個 MerchantTradeNo。thank-you 付款提示僅在「已輸出表單」時略過。
+	 */
+	private static array $redirect_attempts = [];
+
+	/**
 	 * 綠界 AIO 核心支付邏輯
 	 *
 	 * AIO 不在此階段發 API，僅回傳 order-received URL；實際跳轉在 before_order_received
 	 * 以 auto-form submit 至綠界 Cashier。
 	 *
+	 * 顧客於結帳頁選了信用卡分期期數時，先依後台白名單驗證（validate_fields 已驗過，
+	 * 此處為 order-pay 等其他路徑的雙重保險）再依 InstallmentCheckoutField::apply_to_order 的規則更新 order meta
+	 * （本次選「不分期」會清掉上一次的分期），交給 RequestParams 組 CreditInstallment。
+	 *
+	 * 最後標記「待導轉」：本方法只在顧客實際發起付款時執行（classic / block 結帳、WC 沿用 pending 訂單再結帳、
+	 * 我的帳戶 → 付款），order-received 頁據此以新的 MerchantTradeNo 重新導轉綠界。
+	 *
 	 * @param \WC_Order $order 訂單
 	 * @return string order-received URL
+	 * @throws \Exception 分期期數不在允許範圍
 	 */
 	protected function before_process_payment( \WC_Order $order ): string {
+		$periods     = AioSettingsDTO::instance()->get_checkout_installment_periods();
+		$installment = InstallmentCheckoutField::get_posted_installment( $periods );
+		InstallmentCheckoutField::apply_to_order( $order, $installment, InstallmentCheckoutField::is_submitted( $periods ) );
+
+		( new EcpayMetaKeys( $order ) )->mark_redirect_pending();
+
 		return $this->get_return_url( $order );
 	}
 
+	// region 結帳頁信用卡分期欄位
+
 	/**
-	 * 第三方金流頁面 render 前（order-received）
+	 * 是否有結帳欄位（有可選分期期數時為 true，classic checkout 才會渲染 payment_box）
 	 *
-	 * 冪等檢查（已寫入 MerchantTradeNo 則 skip）→ 組裝 RequestParams →
-	 * render auto-form template POST 到綠界 Cashier。
+	 * @return bool
+	 */
+	public function has_fields(): bool {
+		return [] !== AioSettingsDTO::instance()->get_checkout_installment_periods();
+	}
+
+	/**
+	 * Classic checkout 付款方式欄位：描述（+ 既有 tokenization UI）+ 信用卡分期下拉
+	 *
+	 * @return void
+	 */
+	public function payment_fields(): void {
+		parent::payment_fields();
+
+		echo InstallmentCheckoutField::render( AioSettingsDTO::instance()->get_checkout_installment_periods() );
+	}
+
+	/**
+	 * 結帳欄位驗證（classic checkout / Store API legacy / order-pay 皆會在 process_payment 前呼叫）
+	 *
+	 * @return bool 分期期數合法（或不分期）回 true；否則加 error notice 並回 false
+	 */
+	public function validate_fields(): bool {
+		try {
+			InstallmentCheckoutField::get_posted_installment( AioSettingsDTO::instance()->get_checkout_installment_periods() );
+			return true;
+		} catch ( \Throwable $e ) {
+			\wc_add_notice( \__( '所選的信用卡分期期數不在允許範圍，請重新選擇', 'power_checkout' ), 'error' );
+			return false;
+		}
+	}
+
+	// endregion
+
+	/**
+	 * 第三方金流頁面 render 前（order-received）：以新的 MerchantTradeNo 組裝 RequestParams 並 render auto-form
+	 *
+	 * 何時導轉綠界（全部成立才導轉）：
+	 *  1. 訂單仍待付款（needs_payment：pending / failed 且金額 > 0）——已付款絕不再導轉。
+	 *  2. 網址 order key 正確（防匿名列舉 /checkout/order-received/{id}/ 觸發建單、看到訂單內容）。
+	 *  3. 本請求尚未為此訂單輸出過表單（每個 gateway 實例都掛 wp hook，同請求不得產生兩個編號）。
+	 *  4. 顧客剛發起付款（process_payment 留下待導轉旗標），或此訂單從未送出過編號（首次 / 升級前建立的訂單）。
+	 *     單純重訪（重新整理 / 上一頁 / 綠界頁按「返回商店」= ClientBackURL）不自動導轉，避免顧客被困在
+	 *     「返回商店 → 又被導回綠界」的迴圈；thank-you 頁改由 {@see self::render_pending_payment_notice()} 提供付款連結。
+	 *
+	 * 每次導轉都用新的 MerchantTradeNo：綠界同一編號未付款前再送也會拒絕（10300028 訂單編號重覆）。
+	 * 舊編號保留於歷史（EcpayMetaKeys::start_trade_attempt），其 ReturnURL / PaymentInfoURL 仍能反查本訂單。
 	 *
 	 * @param \WC_Order $order 訂單
 	 * @return void
 	 */
 	protected function before_order_received( \WC_Order $order ): void {
+		$order_id = $order->get_id();
+		if ( ! $order->needs_payment() || ! self::is_valid_order_key( $order ) || isset( self::$redirect_attempts[ $order_id ] ) ) {
+			return;
+		}
+
 		try {
 			$meta_keys = new EcpayMetaKeys( $order );
-
-			// 冪等：已建單（已有 MerchantTradeNo）則不重複送
-			if ( $meta_keys->get_trade_no() ) {
+			if ( '' !== $meta_keys->get_trade_no() && ! $meta_keys->is_redirect_pending() ) {
 				return;
 			}
 
-			$request_params = RequestParams::instance( $order, $this );
+			// 先佔位：即使下方組參數失敗，同一請求的其他 gateway 實例也不再重試建單
+			self::$redirect_attempts[ $order_id ] = false;
 
-			// 寫入冪等鍵 MerchantTradeNo
-			$meta_keys->update_trade_no( $request_params->MerchantTradeNo );
+			$trade_no       = TradeNo::encode_unique( $order_id, $meta_keys->get_used_trade_nos() );
+			$request_params = RequestParams::instance( $order, $this, $trade_no );
 
-			$settings = AioSettingsDTO::instance();
+			// 參數組裝成功才記錄本次編號（目前編號 + 歷史）並清除待導轉旗標
+			$meta_keys->start_trade_attempt( $trade_no );
 
 			// render auto-form（隱藏表單自動 submit 至綠界 Cashier）
 			Plugin::load_template(
 				'auto-form',
 				[
 					'params' => $request_params->to_form_params(),
-					'url'    => $settings->endpoint,
+					'url'    => AioSettingsDTO::instance()->endpoint,
 				]
 			);
+			self::$redirect_attempts[ $order_id ] = true;
 		} catch ( \Throwable $e ) {
 			$this->logger( "❌ {$this->title} 建單時發生錯誤<br>{$e->getMessage()}", 'error', [], 5 );
 		}
+	}
+
+	/**
+	 * 檢查 order-received 網址的 order key 是否與訂單相符（timing-safe）
+	 *
+	 * @param \WC_Order $order 訂單
+	 * @return bool
+	 */
+	private static function is_valid_order_key( \WC_Order $order ): bool {
+		// order-received 為 GET 頁面，僅以 order key 驗擁有權（同 WC_Shortcode_Checkout::order_received），無 nonce
+		$key = isset( $_GET['key'] ) && \is_string( $_GET['key'] ) ? \sanitize_text_field( \wp_unslash( $_GET['key'] ) ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+
+		return '' !== $key && \hash_equals( $order->get_order_key(), $key );
+	}
+
+	/**
+	 * [thank-you 頁] 待付款訂單顯示「前往付款」連結（woocommerce_thankyou_ecpay_aio）
+	 *
+	 * 單純重訪 order-received 不自動導轉綠界（見 before_order_received），此處提供重新付款入口：
+	 * 連到 WC 的 order-pay 頁 → process_payment → 回 order-received 以新的 MerchantTradeNo 導轉。
+	 * 已付款 / failed（WC 模板已自帶付款按鈕）/ 本請求已輸出自動導轉表單 → 不顯示（建單失敗時仍顯示，讓顧客有入口重試）。
+	 * classic thankyou.php 與 block 主題 Order Confirmation（AdditionalInformation block）皆會觸發此 hook。
+	 *
+	 * @param int $order_id 訂單 ID
+	 * @return void
+	 */
+	public static function render_pending_payment_notice( int $order_id ): void {
+		if ( true === ( self::$redirect_attempts[ $order_id ] ?? false ) ) {
+			return;
+		}
+
+		$order = \wc_get_order( $order_id );
+		if ( ! $order instanceof \WC_Order || self::ID !== $order->get_payment_method() ) {
+			return;
+		}
+		if ( ! $order->has_status( 'pending' ) || ! $order->needs_payment() ) {
+			return;
+		}
+
+		// 以 printf + 逐一 escape 輸出（heredoc 插值會被 EscapeOutput sniff 視為未 escape）
+		\printf(
+			'<div class="woocommerce-info pc-ecpay-aio-pending-payment">%1$s <a href="%2$s" class="button pay">%3$s</a></div>',
+			\esc_html__( '此訂單尚未完成付款。若已取得 ATM 虛擬帳號或超商繳費代碼，請於期限內依代碼繳費即可；如需重新付款或改用其他付款方式，請點選「前往付款」。', 'power_checkout' ),
+			\esc_url( $order->get_checkout_payment_url() ),
+			\esc_html__( '前往付款', 'power_checkout' )
+		);
 	}
 
 	/** [Admin] 在後台 order detail 頁地址下方顯示資訊 */
@@ -218,7 +340,8 @@ final class AioRedirectGateway extends AbstractPaymentGateway implements IGatewa
 	 * 退款 API 發送（退款創建 woocommerce_order_refunded 時觸發）
 	 *
 	 * 信用卡類訂單呼叫綠界 DoAction(Action=R)；非信用卡 process_refund 已擋下故不會走 API。
-	 * 仿 SLP RedirectGateway：wpdb 交易 + 失敗 order note + 刪 refund。
+	 * 仿 SLP RedirectGateway：wpdb 交易 + 失敗 order note + 刪 refund；
+	 * 失敗時另比照藍新 MpgRedirectGateway：全額退款狀態回滾 + record_refund_error（REST 層取回失敗原因）。
 	 *
 	 * @param int $order_id  訂單 id
 	 * @param int $refund_id 退款 id
@@ -268,6 +391,27 @@ final class AioRedirectGateway extends AbstractPaymentGateway implements IGatewa
 			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore
 			$order->add_order_note( "❌ 綠界 ECPay 退款失敗：{$e->getMessage()}" );
 			$refund->delete( true );
+
+			// 全額退款時 wc_create_refund 先把訂單推到 refunded 才觸發本 hook；
+			// API 失敗 + refund 已刪 → 若不回滾，訂單會殘留 refunded 卻無任何退款記錄。
+			if ( $order->has_status( 'refunded' ) ) {
+				$order->update_status( 'processing', \__( '綠界 ECPay 退款 API 失敗，訂單狀態回滾', 'power_checkout' ) );
+			}
+
+			// 失敗透出（REST 層 consume_refund_error 讀取）：DoActionClient 訊息含「失敗 RtnCode=XXXX」時抽出作 raw_code；
+			// 「回應無法解析」/ 連線失敗 / 缺 TradeNo 等無綠界 RtnCode → null
+			$raw_code = \preg_match( '/失敗 RtnCode=([A-Za-z0-9]+)/u', $e->getMessage(), $m ) ? $m[1] : null;
+			self::record_refund_error(
+				$order,
+				NormalizedError::from(
+					ErrorCode::PROVIDER,
+					$e->getMessage(),
+					[
+						'raw_code' => $raw_code,
+						'provider' => $this->id,
+					]
+				)
+			);
 		}
 	}
 
@@ -392,6 +536,9 @@ final class AioRedirectGateway extends AbstractPaymentGateway implements IGatewa
 		// 整合區塊結帳
 		\add_action( 'woocommerce_blocks_loaded', [ __CLASS__, 'register_checkout_blocks' ] );
 
+		// thank-you 頁：待付款訂單提供「前往付款」入口（單純重訪不自動導轉綠界）
+		\add_action( 'woocommerce_thankyou_' . self::ID, [ __CLASS__, 'render_pending_payment_notice' ] );
+
 		// 後台訂單操作：請款 / 取消授權（woocommerce_order_actions filter + 對應 handler action）
 		\add_filter( 'woocommerce_order_actions', [ __CLASS__, 'add_order_actions' ], 10, 2 );
 		\add_action( 'woocommerce_order_action_' . self::ACTION_CAPTURE, [ __CLASS__, 'handle_capture_action' ] );
@@ -418,7 +565,8 @@ final class AioRedirectGateway extends AbstractPaymentGateway implements IGatewa
 				}
 
 				if ( $gateway instanceof AbstractPaymentGateway ) {
-					$payment_method_registry->register( new BlocksIntegration( $gateway ) );
+					// 用 AIO 專屬 integration，block data 額外帶結帳頁信用卡分期欄位設定
+					$payment_method_registry->register( new AioBlocksIntegration( $gateway ) );
 				}
 			}
 		);

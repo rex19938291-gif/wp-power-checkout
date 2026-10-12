@@ -79,7 +79,31 @@ final class StatusManager {
 			);
 		}
 
+		if ( OrderStatus::PROCESSING === $order_status ) {
+			$this->record_paid_trade_no();
+		}
+
 		$this->order->update_status( $order_status->value );
+	}
+
+	/**
+	 * 付款成功：把「實際付款成功」的 MerchantTradeNo 寫回 `_pc_ecpay_trade_no`
+	 *
+	 * 顧客重試付款會產生多個編號，`_pc_ecpay_trade_no` 平時是「最近一次送出」的編號；付款成功的可能是較早的那個
+	 * （例：用第一次取得的 ATM 帳號繳費）。DoAction（退款 / 請款 / 取消授權）與 QueryTradeInfo 都以
+	 * `_pc_ecpay_trade_no` 當 MerchantTradeNo（TradeNo 則取自本次寫入的付款明細），故須寫回成功的那一個，兩者才會成對。
+	 * 其他編號仍留在歷史（_pc_ecpay_trade_no_history），callback 照樣反查得到。
+	 *
+	 * @return void
+	 */
+	private function record_paid_trade_no(): void {
+		$paid_trade_no = (string) ( $this->_payload['MerchantTradeNo'] ?? '' );
+		$meta_keys     = new EcpayMetaKeys( $this->order );
+		if ( '' === $paid_trade_no || $paid_trade_no === $meta_keys->get_trade_no() ) {
+			return;
+		}
+
+		$meta_keys->settle_trade_no( $paid_trade_no );
 	}
 
 	/**

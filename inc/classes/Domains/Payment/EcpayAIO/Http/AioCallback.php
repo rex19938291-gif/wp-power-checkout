@@ -100,7 +100,9 @@ final class AioCallback extends ApiBase {
 	 * 處理付款結果通知
 	 *
 	 * 驗章失敗 → 維持狀態、不更新明細（仍由呼叫端回 1|OK）。
-	 * 冪等：MerchantTradeNo 已處理（已 processing）→ skip。
+	 * 訂單以 MerchantTradeNo 反查（含顧客重試付款前送出過的歷史編號）。
+	 * 冪等：訂單已入帳（已付款 processing / completed，或已全額退款 refunded）→ 不再交給 StatusManager，
+	 * 不覆寫付款明細、不回退狀態；若是「另一個編號」的付款成功（顧客重試後兩邊都付了）→ 加註重複付款警告。
 	 *
 	 * @param array<string, mixed> $params ReturnURL 通知參數
 	 * @return void
@@ -117,8 +119,9 @@ final class AioCallback extends ApiBase {
 			throw new \Exception( "找不到訂單，MerchantTradeNo: {$trade_no}" );
 		}
 
-		// 冪等：已轉為 processing（已付款）則不重複處理
-		if ( $order->has_status( \J7\PowerCheckout\Domains\Payment\Shared\Enums\OrderStatus::PROCESSING->value ) ) {
+		// 冪等：已入帳則不重複處理（重送不重複入帳；另一編號的付款成功則加註重複付款）
+		if ( self::is_settled( $order ) ) {
+			self::note_duplicate_payment( $order, $params, $trade_no );
 			return;
 		}
 
@@ -129,10 +132,59 @@ final class AioCallback extends ApiBase {
 	}
 
 	/**
+	 * 訂單是否已入帳（不得再由付款通知改寫狀態 / 明細）
+	 *
+	 * 已付款（processing / completed，即 is_paid）或已全額退款（refunded）。
+	 * cancelled 不算：未付款訂單被 WC 逾時取消後，顧客仍可能用先前取得的 ATM / 超商代碼繳費，須能入帳。
+	 *
+	 * @param \WC_Order $order 訂單
+	 * @return bool
+	 */
+	private static function is_settled( \WC_Order $order ): bool {
+		return $order->is_paid() || $order->has_status( 'refunded' );
+	}
+
+	/**
+	 * 已入帳訂單又收到「另一個 MerchantTradeNo」的付款成功通知 → 加註重複付款警告（不改狀態 / 明細）
+	 *
+	 * 情境：顧客重試付款產生多個編號（例：先取 ATM 帳號、回來改刷卡付款成功），之後又用舊 ATM 帳號繳費。
+	 * 兩筆都是真實付款，第二筆不能默默吞掉，須讓站方看到並至綠界後台核對 / 人工退款。
+	 * 同編號重送（_pc_ecpay_trade_no 即為付款成功的編號）→ 正常冪等，不加註。
+	 *
+	 * @param \WC_Order            $order    訂單
+	 * @param array<string, mixed> $params   ReturnURL 通知參數（已驗章）
+	 * @param string               $trade_no 通知的 MerchantTradeNo
+	 * @return void
+	 */
+	private static function note_duplicate_payment( \WC_Order $order, array $params, string $trade_no ): void {
+		$rtn_code = (string) ( $params['RtnCode'] ?? '' );
+		$settled  = ( new EcpayMetaKeys( $order ) )->get_trade_no();
+		if ( ! RtnCode::is_paid_success( $rtn_code ) || $trade_no === $settled ) {
+			return;
+		}
+
+		$order->add_order_note(
+			WP::array_to_html(
+				$params,
+				[
+					'title' => \sprintf(
+						/* translators: 1: 本次通知的 MerchantTradeNo, 2: 訂單已記錄的付款編號 */
+						\__( '⚠️ 疑似重複付款：此訂單已入帳（付款編號 %2$s），又收到 MerchantTradeNo %1$s 的付款成功通知。訂單狀態與付款明細未變更，請至綠界廠商後台核對，必要時人工退款。', 'power_checkout' ),
+						$trade_no,
+						'' !== $settled ? $settled : '-'
+					),
+				]
+			)
+		);
+	}
+
+	/**
 	 * 處理取號結果通知（ATM/CVS/BARCODE）
 	 *
 	 * 驗章失敗 → 不寫入取號資訊、不改狀態。
 	 * 取號成功（RtnCode='2' ATM / '10100073' CVS/BARCODE）→ 寫繳費資訊 + order note，不改狀態。
+	 * 訂單以 MerchantTradeNo 反查（含重試前的歷史編號）；冪等以 MerchantTradeNo 為單位：
+	 * 同編號重送略過，顧客重試後新編號取號則更新為最新的繳費資訊（舊資訊仍留在 order note）。
 	 *
 	 * @param array<string, mixed> $params PaymentInfoURL 通知參數
 	 * @return void
@@ -157,8 +209,9 @@ final class AioCallback extends ApiBase {
 
 		$meta_keys = new EcpayMetaKeys( $order );
 
-		// 冪等：已寫入取號資訊則不重複
-		if ( $meta_keys->get_payment_info() ) {
+		// 冪等：同一 MerchantTradeNo 的取號資訊已寫入則不重複（重試後的新編號取號須更新）
+		$existing_trade_no = (string) ( $meta_keys->get_payment_info()['MerchantTradeNo'] ?? '' );
+		if ( $trade_no === $existing_trade_no ) {
 			return;
 		}
 

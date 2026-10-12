@@ -106,8 +106,28 @@ final class AioSettingsDTO extends DTO implements IGatewaySettings {
 	 */
 	public int $unionPay = 0;
 
-	/** @var array<int> 信用卡分期期數 */
-	public array $installmentPeriods = [ 3, 6, 12, 18, 24, 30 ];
+	/**
+	 * @var bool 是否在結帳頁提供信用卡分期選項
+	 *
+	 * 開啟且 allowedPayments 含 Credit、installmentPeriods 非空時，classic checkout（payment_fields）
+	 * 與 block checkout（ecpay_aio.tsx）顯示分期下拉，由顧客選擇「不分期」或指定期數。
+	 *
+	 * 為何不比照藍新做成「開啟即一律送期數」：綠界收銀台只要帶 CreditInstallment，信用卡就只剩分期
+	 * （一次付清選項被隱藏），全站一律送會強迫所有信用卡訂單分期，故改由顧客於結帳頁自選。
+	 *
+	 * 預設關閉：installmentPeriods 預設即有期數且多半已存進 DB，若直接顯示分期選項，
+	 * 未於綠界廠商後台開通信用卡分期的既有商家會突然出現無法使用的選項。
+	 */
+	public bool $enableInstallment = false;
+
+	/**
+	 * @var array<int> 信用卡分期期數（後台白名單，結帳頁可選期數）
+	 *
+	 * 綠界一般分期：3 / 6 / 12 / 18 / 24。30 期為永豐「圓夢彈性分期」（送綠界時轉 30N，
+	 * 需另向綠界申請、限永豐卡、須達最低交易金額，未達時交易失敗），故預設不勾選，
+	 * 由商家於設定頁自行勾選。
+	 */
+	public array $installmentPeriods = [ 3, 6, 12, 18, 24 ];
 
 	/**
 	 * @var array<string, mixed> 定期定額設定（PeriodAmount / PeriodType / Frequency / ExecTimes）
@@ -151,6 +171,14 @@ final class AioSettingsDTO extends DTO implements IGatewaySettings {
 			);
 		}
 
+		// enableInstallment 正規化為 bool（REST 設定儲存經 sanitize_text_field 會變 '1' / ''；亦相容 'yes' / 'no' / 布林）
+		if ( isset( $this->dto_data['enableInstallment'] ) ) {
+			$this->dto_data['enableInstallment'] = \filter_var(
+				$this->dto_data['enableInstallment'],
+				FILTER_VALIDATE_BOOLEAN
+			);
+		}
+
 		// installmentPeriods 一律正規化為 int（admin form 送來可能是字串，
 		// 供 RequestParams 以 strict in_array 比對分期期數白名單）
 		if ( isset( $this->dto_data['installmentPeriods'] ) && \is_array( $this->dto_data['installmentPeriods'] ) ) {
@@ -158,6 +186,30 @@ final class AioSettingsDTO extends DTO implements IGatewaySettings {
 				\array_map( static fn( $period ) => (int) $period, $this->dto_data['installmentPeriods'] )
 			);
 		}
+	}
+
+	/**
+	 * 取得結帳頁可供顧客選擇的分期期數
+	 *
+	 * 開關 enableInstallment 開啟、allowedPayments 含 Credit、installmentPeriods 非空時，
+	 * 回傳排序去重後的正整數期數（如 [3, 6, 12]）；任一條件不成立回空陣列（結帳頁不顯示分期欄位）。
+	 *
+	 * @return array<int> 可選期數
+	 */
+	public function get_checkout_installment_periods(): array {
+		$has_credit = \in_array( EcpayPaymentMethod::CREDIT->value, $this->allowedPayments, true );
+		if ( ! $this->enableInstallment || ! $has_credit ) {
+			return [];
+		}
+
+		$periods = \array_values(
+			\array_unique(
+				\array_filter( $this->installmentPeriods, static fn( int $period ): bool => $period > 0 )
+			)
+		);
+		\sort( $periods, SORT_NUMERIC );
+
+		return $periods;
 	}
 
 	/**

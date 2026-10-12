@@ -11,6 +11,7 @@ import TrimmedInput from '@/components/TrimmedInput.vue'
 import { env } from '@/index'
 import { EEcpayAioPaymentMethod } from '@/pages/Payments/EcpayAio/Shared/enums'
 import {
+	getInstallmentPeriodLabel,
 	INSTALLMENT_PERIODS,
 	PAYMENT_METHODS,
 	TFormData,
@@ -51,9 +52,19 @@ const form = reactive<TFormData>({
 
 	// --- 付款方式與分期 --- //
 	allowedPayments: [],
+	enableInstallment: false,
 	installmentPeriods: [],
 	periodConfig: {},
 })
+
+/**
+ * 將後端回傳的開關值正規化為 boolean
+ *
+ * provider 未啟用時 API 回傳 wp_options 原始值（REST 儲存經 sanitize_text_field 會變 '1' / ''），
+ * 啟用時則為 DTO 正規化後的 boolean，兩者皆需支援。
+ */
+const toBoolean = (value: unknown): boolean =>
+	['1', 'yes', 'true', 'on'].includes(String(value).toLowerCase())
 
 watch(
 	data,
@@ -65,8 +76,7 @@ watch(
 				filteredData.mode = 'prod'
 			}
 			merge(form, filteredData)
-
-			// 將 API 回傳資料輸入表單
+			form.enableInstallment = toBoolean(newData.enableInstallment)
 		}
 	},
 	{ immediate: true }
@@ -74,8 +84,14 @@ watch(
 
 const isTestMode = computed(() => form.mode === 'test')
 
+// 勾選信用卡才顯示「在結帳頁提供信用卡分期選項」開關
 const showInstallment = computed(() =>
 	form.allowedPayments.includes(EEcpayAioPaymentMethod.CREDIT)
+)
+
+// 勾選信用卡且開關開啟，才顯示分期期數
+const showInstallmentPeriods = computed(
+	() => showInstallment.value && form.enableInstallment
 )
 
 const onSubmit = async () => {
@@ -110,6 +126,21 @@ const rules = reactive<FormRules<TFormData>>({
 			validator: (_, value, callback) => {
 				if (Array.isArray(value) && value.length === 0) {
 					callback(new Error('請至少選擇一種付款方式'))
+					return
+				}
+				callback()
+			},
+		},
+	],
+	installmentPeriods: [
+		{
+			validator: (_, value, callback) => {
+				// 開關開啟時至少要勾一個期數，否則結帳頁不會出現分期選項
+				if (
+					showInstallmentPeriods.value &&
+					(!Array.isArray(value) || value.length === 0)
+				) {
+					callback(new Error('開啟信用卡分期時，請至少選擇一個分期期數'))
 					return
 				}
 				callback()
@@ -304,18 +335,40 @@ const rules = reactive<FormRules<TFormData>>({
 			</el-checkbox-group>
 		</el-form-item>
 
-		<el-form-item
-			v-if="showInstallment"
-			prop="installmentPeriods"
-			label="信用卡分期期數"
-		>
+		<el-form-item v-if="showInstallment" prop="enableInstallment">
+			<template #label>
+				<span class="flex gap-x-2 items-center">
+					<span>在結帳頁提供信用卡分期</span>
+					<el-tooltip
+						content="需先於綠界廠商後台開通信用卡分期。開啟後顧客可在結帳頁選擇「不分期」或指定期數；選擇分期時，綠界付款頁只會提供信用卡分期（不含一次付清與其他付款方式），因此分期須由顧客在結帳頁主動選擇"
+						placement="top"
+					>
+						<el-icon><InfoFilled /></el-icon>
+					</el-tooltip>
+				</span>
+			</template>
+			<el-switch v-model="form.enableInstallment" />
+		</el-form-item>
+
+		<el-form-item v-if="showInstallmentPeriods" prop="installmentPeriods">
+			<template #label>
+				<span class="flex gap-x-2 items-center">
+					<span>信用卡分期期數</span>
+					<el-tooltip
+						content="一般分期為 3 / 6 / 12 / 18 / 24 期，請只勾選已於綠界開通的期數。30 期為永豐圓夢彈性分期（送出 30N），需另向綠界申請、僅限永豐信用卡，且訂單金額須達最低交易金額（可於綠界廠商後台查詢），未達時交易失敗"
+						placement="top"
+					>
+						<el-icon><InfoFilled /></el-icon>
+					</el-tooltip>
+				</span>
+			</template>
 			<el-checkbox-group v-model="form.installmentPeriods">
 				<el-checkbox
 					v-for="period in INSTALLMENT_PERIODS"
 					:key="period"
 					:label="period"
 				>
-					{{ period }} 期
+					{{ getInstallmentPeriodLabel(period) }}
 				</el-checkbox>
 			</el-checkbox-group>
 		</el-form-item>

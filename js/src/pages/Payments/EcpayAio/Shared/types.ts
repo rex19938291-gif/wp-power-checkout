@@ -43,7 +43,7 @@ export const PAYMENT_METHODS = [
 ] as const
 
 /**
- * 信用卡分期期數選項（對齊 AioSettingsDTO::$installmentPeriods 預設 3/6/12/18/24/30）
+ * 信用卡分期期數選項（AioSettingsDTO::$installmentPeriods 預設 3/6/12/18/24，30 期需商家自行勾選）
  *
  * 後端 before_init 會將期數正規化為 int，故以 number 表示。
  */
@@ -55,6 +55,24 @@ export const INSTALLMENT_PERIODS: number[] = [
 	24,
 	30,
 ]
+
+/**
+ * 綠界 30 期 = 永豐「圓夢彈性分期」（後端送綠界時轉為 30N；送 30 會被綠界忽略）
+ *
+ * 需另向綠界申請、僅限永豐信用卡，且訂單金額須達最低交易金額，未達時交易失敗。
+ */
+export const FLEXIBLE_INSTALLMENT_PERIOD = 30
+
+/**
+ * 分期期數 checkbox 顯示文字
+ *
+ * @param period 期數
+ * @return 例：「6 期」、「30 期（永豐圓夢彈性分期）」
+ */
+export const getInstallmentPeriodLabel = (period: number): string =>
+	period === FLEXIBLE_INSTALLMENT_PERIOD
+		? `${period} 期（永豐圓夢彈性分期）`
+		: `${period} 期`
 
 /**
  * 綠界 AIO 後台設定表單資料（對齊 AioSettingsDTO）
@@ -79,6 +97,9 @@ export type TFormData = {
 
 	// --- 付款方式與分期 --- //
 	allowedPayments: string[]
+
+	/** 在結帳頁提供信用卡分期選項（預設關閉；需先於綠界廠商後台開通信用卡分期） */
+	enableInstallment: boolean
 	installmentPeriods: number[]
 	periodConfig: Record<string, unknown>
 }

@@ -6,6 +6,7 @@ namespace J7\PowerCheckout\Domains\Payment\EcpayAIO\DTOs;
 
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Enums\EcpayPaymentMethod;
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Helpers\CheckMacValueService;
+use J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Helpers\CreditInstallment;
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Helpers\EcpayMetaKeys;
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Helpers\ItemName;
 use J7\PowerCheckout\Domains\Payment\EcpayAIO\Shared\Helpers\TradeNo;
@@ -122,10 +123,11 @@ final class RequestParams extends DTO {
 	// region 信用卡分期 / 定期定額（皆屬 ChoosePayment=Credit，互斥）
 
 	/**
-	 * @var string 信用卡分期期數（單一值，如 '6'）。空字串代表非分期。
+	 * @var string 信用卡分期期數（綠界參數值，如 '6'、'3,6'、'30N'）。空字串代表非分期。
 	 *
-	 * 分期與定期定額互斥；選分期時 ChoosePayment 固定為 Credit。
-	 * 期數須在 AioSettingsDTO::installmentPeriods 白名單內（於 build_credit_variant 驗證）。
+	 * 分期與定期定額互斥；選分期時 ChoosePayment 固定為 Credit（綠界收銀台帶分期即只剩信用卡分期）。
+	 * 期數須在 AioSettingsDTO::installmentPeriods 白名單內，30 期轉 30N
+	 * （於 build_credit_variant 經 CreditInstallment::normalize 驗證與轉換）。
 	 */
 	public string $CreditInstallment = '';
 
@@ -174,12 +176,14 @@ final class RequestParams extends DTO {
 	/**
 	 * 由訂單與 gateway 組裝建單參數
 	 *
-	 * @param \WC_Order              $order   訂單
-	 * @param AbstractPaymentGateway $gateway 付款閘道
+	 * @param \WC_Order              $order             訂單
+	 * @param AbstractPaymentGateway $gateway           付款閘道
+	 * @param string                 $merchant_trade_no 本次送出的 MerchantTradeNo；空字串則以 TradeNo::encode 產生
+	 *                                                  （導轉流程由 AioRedirectGateway 以 TradeNo::encode_unique 避開本訂單用過的編號後傳入）
 	 *
 	 * @return self
 	 */
-	public static function instance( \WC_Order $order, AbstractPaymentGateway $gateway ): self {
+	public static function instance( \WC_Order $order, AbstractPaymentGateway $gateway, string $merchant_trade_no = '' ): self {
 		$settings = AioSettingsDTO::instance();
 
 		$language     = ItemName::get_language();
@@ -189,7 +193,7 @@ final class RequestParams extends DTO {
 
 		$data = [
 			'MerchantID'        => $settings->merchantId,
-			'MerchantTradeNo'   => TradeNo::encode( $order->get_id() ),
+			'MerchantTradeNo'   => '' !== $merchant_trade_no ? $merchant_trade_no : TradeNo::encode( $order->get_id() ),
 			'MerchantTradeDate' => \wp_date( 'Y/m/d H:i:s' ) ?: \gmdate( 'Y/m/d H:i:s', \time() + 8 * 3600 ),
 			'PaymentType'       => 'aio',
 			// 綠界僅收新台幣整數，無條件進位避免少收
@@ -223,13 +227,21 @@ final class RequestParams extends DTO {
 	}
 
 	/**
-	 * 依顧客於 checkout 的選擇（order meta）組裝信用卡分期 / 定期定額參數
+	 * 依 order meta 組裝信用卡分期 / 定期定額參數
 	 *
 	 * 變體決策機制（非前端直接控制送往綠界的 raw 參數，避免竄改）：
-	 *  - 顧客選擇存於 order meta `_pc_ecpay_credit_variant`（''｜'installment'｜'period'），
+	 *  - 變體存於 order meta `_pc_ecpay_credit_variant`（''｜'installment'｜'period'），
 	 *    分期期數存於 `_pc_ecpay_installment`，定期定額週期由後台 `AioSettingsDTO::periodConfig` 決定。
+	 *  - 'installment' 的寫入來源：
+	 *    a. 顧客於結帳頁分期下拉選擇（AioSettingsDTO::enableInstallment 開啟時顯示；
+	 *       InstallmentCheckoutField 於 validate_fields / before_process_payment 白名單驗證後寫入單一期數，如 "6"）。
+	 *    b. 第三方外掛自行寫 meta（向後相容，可寫逗號分隔多期數如 "3,6"，由顧客在綠界頁選期數）。
+	 *    兩者皆經 CreditInstallment::normalize 逐段 ctype_digit + 白名單驗證（30 → 30N），任一段不合法即 throw。
+	 *  - 'period'（定期定額）：**開發者 / 訂閱外掛用的擴充點**，設定頁無對應 UI；
+	 *    需自行寫 `_pc_ecpay_credit_variant='period'` 並於 option 設定 periodConfig（PeriodType / Frequency / ExecTimes）。
 	 *  - 選分期或定期定額時，ChoosePayment 固定為 'Credit'（兩者皆 Credit-only，不再用 ALL+IgnorePayment）。
-	 *  - 分期與定期定額互斥；變體為空字串則維持原 ALL 流程。
+	 *    綠界收銀台只要帶 CreditInstallment，信用卡區塊就只剩分期（一次付清被隱藏），故分期只能由顧客主動選擇。
+	 *  - 分期與定期定額互斥；變體為空字串則維持原 ALL 流程（不送 CreditInstallment）。
 	 *
 	 * @param array<string, mixed> $data         已組裝的基礎建單資料
 	 * @param \WC_Order            $order        訂單
@@ -251,14 +263,9 @@ final class RequestParams extends DTO {
 		$variant   = $meta_keys->get_credit_variant();
 
 		if ( 'installment' === $variant ) {
-			$installment = $meta_keys->get_installment();
-			// 期數須在後台白名單內，否則拒絕建單
-			if ( '' === $installment || ! \in_array( (int) $installment, $settings->installmentPeriods, true ) ) {
-				throw new \Exception( '分期期數不在允許範圍' );
-			}
 			$data['ChoosePayment']     = 'Credit'; // 分期屬 Credit
 			$data['IgnorePayment']     = '';       // Credit-only 不再用 IgnorePayment
-			$data['CreditInstallment'] = $installment;
+			$data['CreditInstallment'] = CreditInstallment::normalize( $meta_keys->get_installment(), $settings->installmentPeriods );
 			// Credit-only：BNPL 不存在、銀聯不支援分期，清除兩者避免衝突
 			$data['ChooseSubPayment'] = '';
 			$data['UnionPay']         = -1;
