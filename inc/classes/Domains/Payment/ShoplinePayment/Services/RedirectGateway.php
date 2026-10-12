@@ -314,8 +314,10 @@ final class RedirectGateway extends PaymentGateway implements IGateway {
 			$wpdb->query('COMMIT'); // phpcs:ignore
 		} catch (\Throwable $e) {
 			$wpdb->query('ROLLBACK'); // phpcs:ignore
-			$order->add_order_note( "❌ 退款失敗：{$e->getMessage()}" );
-			$refund->delete(true);
+
+			// raw_code：Requester 以 SLP 錯誤碼作為例外 code（0 = 無 SLP 錯誤碼，如連線失敗）
+			$raw_code = 0 !== $e->getCode() ? (string) $e->getCode() : null;
+			self::fail_gateway_refund( $order, $refund, 'Shopline Payment', $e->getMessage(), $raw_code );
 		}
 	}
 

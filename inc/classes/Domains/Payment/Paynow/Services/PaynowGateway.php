@@ -399,11 +399,11 @@ final class PaynowGateway extends AbstractPaymentGateway implements IPaymentProv
 	 *  2. refund 物件守衛：缺 / 非 gateway 退款（手動退款）→ 不發 API。
 	 *  3. 能力守衛：非信用卡 / ATM → note 提示 + 不發 API（process_refund 理應已擋，雙重防禦）。
 	 *  4. PaymentIntentId 守衛：缺 intent_id → 無法組退款端點 → 失敗（ROLLBACK + 刪 refund）。
-	 *  5. ATM 守衛：缺 bank 三欄 → note 提示「銀行」必填 + 不發 API（不視為失敗，不刪 refund）。
+	 *  5. ATM 守衛：缺 bank 三欄 → 不發 API，視同失敗（fail_gateway_refund，ErrorCode::VALIDATION，提示「銀行」必填）。
 	 *  6. wpdb TRANSACTION → RestClient::refund：
 	 *     - result.type=success → 寫 _pc_paynow_refund_detail + note '退款成功' → COMMIT。
 	 *     - result.type=rejected / failed / 其餘非 success → 視同失敗 → ROLLBACK + 刪 refund + note（含拒絕原因）。
-	 *  7. 任何 \Throwable（含 API 失敗）→ ROLLBACK + note '退款失敗' + 刪 refund。
+	 *  7. 任何 \Throwable（含 API 失敗）→ ROLLBACK + fail_gateway_refund（note '退款失敗' + 刪 refund + 全額退款狀態回滾 + 失敗原因透出）。
 	 *
 	 * 金額一律來自 WC refund 物件（非前端），防止前端竄改金額。
 	 *
@@ -434,12 +434,18 @@ final class PaynowGateway extends AbstractPaymentGateway implements IPaymentProv
 		$amount = (float) $refund->get_amount(); // 金額一律來自 WC refund 物件，非前端
 		$reason = (string) $refund->get_reason();
 
-		// ATM 退款守衛：缺 bank 三欄 → 拒絕送出 + note 提示「銀行」必填（不視為失敗、不刪 refund，待補填重試）
+		// ATM 退款守衛：缺 bank 三欄 → 不送 API，視同退款失敗（刪 refund + 狀態回滾 + 透出原因）。
+		// refund 若留著，WC 會當成已退款（可退餘額歸零），補填銀行資料後也無法再發起退款。
 		$is_atm    = PaynowPaymentMethod::ATM->value === $payment_type;
 		$bank_data = self::get_refund_bank_data( $order );
 		if ( $is_atm && ! self::has_complete_bank_data( $bank_data ) ) {
-			$order->add_order_note(
-				\__( '⚠️ ATM 退款必填銀行代碼 / 分行代碼 / 帳號（bankCode / bankBranchCode / bankAccount），請補填後重試', 'power_checkout' )
+			self::fail_gateway_refund(
+				$order,
+				$refund,
+				'PayNow',
+				\__( 'ATM 退款必填銀行代碼 / 分行代碼 / 帳號（bankCode / bankBranchCode / bankAccount），請補填後重試', 'power_checkout' ),
+				null,
+				ErrorCode::VALIDATION
 			);
 			return;
 		}
@@ -502,9 +508,7 @@ final class PaynowGateway extends AbstractPaymentGateway implements IPaymentProv
 			);
 		} catch ( \Throwable $e ) {
 			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore
-			$order->add_order_note( "❌ PayNow 退款失敗：{$e->getMessage()}" );
-			\wc_delete_shop_order_transients( $order );
-			$refund->delete( true );
+			self::fail_gateway_refund( $order, $refund, 'PayNow', $e->getMessage() );
 			Plugin::logger(
 				"PayNow 退款失敗 #{$order_id}",
 				'error',

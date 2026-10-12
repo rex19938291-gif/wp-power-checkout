@@ -325,7 +325,7 @@ final class EcpgGateway extends AbstractPaymentGateway implements IGateway {
 	 * 退款 API 發送（退款創建 woocommerce_order_refunded 時觸發）
 	 *
 	 * 信用卡類訂單呼叫綠界 ecpayment domain DoAction(Action=R)；非信用卡 process_refund 已擋下故不會走 API。
-	 * 仿 SLP RedirectGateway：wpdb 交易 + 失敗 order note + 刪 refund。
+	 * wpdb 交易；失敗收尾走 fail_gateway_refund（刪 refund + 全額退款狀態回滾 + 失敗原因透出給 REST 層）。
 	 *
 	 * @param int $order_id  訂單 id
 	 * @param int $refund_id 退款 id
@@ -374,8 +374,10 @@ final class EcpgGateway extends AbstractPaymentGateway implements IGateway {
 			$wpdb->query( 'COMMIT' ); // phpcs:ignore
 		} catch ( \Throwable $e ) {
 			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore
-			$order->add_order_note( "❌ 綠界 ECPay 站內付退款失敗：{$e->getMessage()}" );
-			$refund->delete( true );
+
+			// raw_code：EcpgApiClient 訊息含「RtnCode=XXXX」（業務層）或「TransCode=XXXX」（傳輸層）時抽出
+			$raw_code = \preg_match( '/(?:RtnCode|TransCode)=(-?\d+)/', $e->getMessage(), $m ) ? $m[1] : null;
+			self::fail_gateway_refund( $order, $refund, '綠界 ECPay 站內付', $e->getMessage(), $raw_code );
 		}
 	}
 

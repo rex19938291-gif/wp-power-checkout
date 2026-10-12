@@ -385,7 +385,7 @@ final class PayuniUniEmbedGateway extends AbstractPaymentGateway implements IPay
 	 *    後台訂單操作 / REST /refund / 測試皆以靜態形式呼叫。
 	 *
 	 * 信用卡 → Close CloseType=2；非信用卡 process_refund 已擋下故不會走 API（此處雙重防禦）。
-	 * 仿 UPP：wpdb 交易 + 失敗 order note + 刪 refund（ROLLBACK）。
+	 * wpdb 交易；失敗收尾走 fail_gateway_refund（刪 refund + 全額退款狀態回滾 + 失敗原因透出給 REST 層）。
 	 * 金額一律來自 WC refund 物件，非前端。
 	 *
 	 * @param int $order_id  訂單 id
@@ -434,9 +434,10 @@ final class PayuniUniEmbedGateway extends AbstractPaymentGateway implements IPay
 			( new PayuniUniEmbedMetaKeys( $order ) )->update_capture_status( 'refunded' );
 		} catch ( \Throwable $e ) {
 			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore
-			$order->add_order_note( "❌ PAYUNi UNi Embed 退款失敗：{$e->getMessage()}" );
-			\wc_delete_shop_order_transients( $order );
-			$refund->delete( true );
+
+			// raw_code：UniDoActionClient 訊息含 PAYUNi 外層「Status=XXXX」時抽出
+			$raw_code = \preg_match( '/Status=([A-Za-z0-9_]+)/', $e->getMessage(), $m ) ? $m[1] : null;
+			self::fail_gateway_refund( $order, $refund, 'PAYUNi UNi Embed', $e->getMessage(), $raw_code );
 		}
 	}
 

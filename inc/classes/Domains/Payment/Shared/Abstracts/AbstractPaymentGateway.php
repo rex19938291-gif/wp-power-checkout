@@ -103,6 +103,9 @@ abstract class AbstractPaymentGateway extends \WC_Payment_Gateway implements IPa
 
 		\add_action('woocommerce_order_refunded', [ static::class, 'handle_payment_gateway_refund' ], 10, 2);
 
+		// 記住全額退款前的訂單狀態，退款 API 失敗時回滾用（self::class：全部 gateway 共用一個 listener）
+		\add_action('woocommerce_order_status_changed', [ self::class, 'remember_status_before_refund' ], 10, 3);
+
 		// 訂閱收款
 		// \add_action( 'woocommerce_scheduled_subscription_payment_dummy', array( $this, 'process_subscription_payment' ), 10, 2 );
 
@@ -460,10 +463,83 @@ abstract class AbstractPaymentGateway extends \WC_Payment_Gateway implements IPa
 	/** @var string 退款 API 失敗記錄 meta key（read-once，由 consume_refund_error 讀取後即刪） */
 	protected const REFUND_ERROR_META = '_pc_refund_error';
 
+	/** @var array<int, string> 本次請求中訂單被改為 refunded 前的狀態（order_id => status，無 wc- 前綴），供退款失敗回滾 */
+	private static array $status_before_refund = [];
+
 	/**
-	 * 記錄退款 API 失敗（供 gateway 的 process_gateway_refund catch 區塊呼叫）
+	 * 記住訂單被改為 refunded 前的狀態（woocommerce_order_status_changed）
 	 *
-	 * process_gateway_refund 由 woocommerce_order_refunded hook 觸發、失敗時吞例外
+	 * 全額退款時 wc_create_refund 先把訂單改成 refunded，之後才觸發 woocommerce_order_refunded（退款 API 在此才送出），
+	 * 到 hook 內訂單已是 refunded，原本的狀態（processing / completed …）只能在狀態變更當下記下。
+	 *
+	 * @param int    $order_id 訂單 id
+	 * @param string $from     原狀態
+	 * @param string $to       新狀態
+	 * @return void
+	 */
+	public static function remember_status_before_refund( int $order_id, string $from, string $to ): void {
+		if ( 'refunded' === $to && 'refunded' !== $from ) {
+			self::$status_before_refund[ $order_id ] = $from;
+		}
+	}
+
+	/**
+	 * 退款 API 失敗的共用收尾（各 gateway 的 process_gateway_refund catch 區塊於 ROLLBACK 後呼叫）
+	 *
+	 *  1. order note 記錄失敗原因
+	 *  2. 刪除 WC refund（錢沒退成，不能留下退款記錄）
+	 *  3. 全額退款：訂單已被 wc_create_refund 改成 refunded → 回滾到退款前的狀態（查不到時回 processing）
+	 *  4. record_refund_error：REST /refund 以 consume_refund_error 取回失敗原因，後台退款視窗才看得到
+	 *
+	 * @param \WC_Order        $order    訂單
+	 * @param \WC_Order_Refund $refund   本次 WC refund（將被刪除）
+	 * @param string           $label    金流名稱（order note 用，例：「綠界 ECPay」）
+	 * @param string           $message  失敗原因（同時回給後台退款視窗）
+	 * @param string|null      $raw_code 金流原始錯誤碼（無則 null）
+	 * @param ErrorCode        $code     正規化錯誤碼
+	 * @return void
+	 */
+	protected static function fail_gateway_refund(
+		\WC_Order $order,
+		\WC_Order_Refund $refund,
+		string $label,
+		string $message,
+		?string $raw_code = null,
+		ErrorCode $code = ErrorCode::PROVIDER
+	): void {
+		$order->add_order_note( "❌ {$label} 退款失敗：{$message}" );
+		$refund->delete( true );
+		\wc_delete_shop_order_transients( $order );
+
+		$order_id = $order->get_id();
+		$previous = self::$status_before_refund[ $order_id ] ?? '';
+		unset( self::$status_before_refund[ $order_id ] );
+
+		if ( $order->has_status( 'refunded' ) ) {
+			$order->update_status(
+				'' !== $previous ? $previous : 'processing',
+				/* translators: %s: 金流名稱 */
+				\sprintf( \__( '%s 退款 API 失敗，訂單狀態回滾', 'power_checkout' ), $label )
+			);
+		}
+
+		static::record_refund_error(
+			$order,
+			NormalizedError::from(
+				$code,
+				$message,
+				[
+					'raw_code' => $raw_code,
+					'provider' => $order->get_payment_method(),
+				]
+			)
+		);
+	}
+
+	/**
+	 * 記錄退款 API 失敗（由 fail_gateway_refund 呼叫）
+	 *
+	 * 由 woocommerce_order_refunded hook 觸發的 process_gateway_refund 失敗時吞例外
 	 * （order note + 刪 refund），呼叫端（REST / WC admin）無從得知結果。
 	 * 此方法把正規化錯誤存到訂單 meta，REST 層以 consume_refund_error() 取回並回應。
 	 *

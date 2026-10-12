@@ -228,7 +228,7 @@ final class MpgRedirectGateway extends AbstractPaymentGateway implements IGatewa
 	 *
 	 * 信用卡 → Close CloseType=2；e-wallet → /API/EWallet/refund。
 	 * 非信用卡 / 非 e-wallet process_refund 已擋下故不會走 API。
-	 * 仿綠界 AIO：wpdb 交易 + 失敗 order note + 刪 refund。
+	 * wpdb 交易；失敗收尾走 fail_gateway_refund（刪 refund + 全額退款狀態回滾 + 失敗原因透出給 REST 層）。
 	 *
 	 * @param int $order_id  訂單 id
 	 * @param int $refund_id 退款 id
@@ -284,28 +284,10 @@ final class MpgRedirectGateway extends AbstractPaymentGateway implements IGatewa
 			$wpdb->query( 'COMMIT' ); // phpcs:ignore
 		} catch ( \Throwable $e ) {
 			$wpdb->query( 'ROLLBACK' ); // phpcs:ignore
-			$order->add_order_note( "❌ 藍新金流退款失敗：{$e->getMessage()}" );
-			$refund->delete( true );
 
-			// 全額退款時 wc_create_refund 先把訂單推到 refunded 才觸發本 hook；
-			// API 失敗 + refund 已刪 → 若不回滾，訂單會殘留 refunded 卻無任何退款記錄。
-			if ( $order->has_status( 'refunded' ) ) {
-				$order->update_status( 'processing', \__( '藍新金流退款 API 失敗，訂單狀態回滾', 'power_checkout' ) );
-			}
-
-			// 失敗透出（REST 層 consume_refund_error 讀取）：訊息含藍新 Status 碼時抽出作 raw_code
+			// raw_code：訊息含藍新 Status 碼時抽出
 			$raw_code = \preg_match( '/Status=([A-Z0-9]+)/', $e->getMessage(), $m ) ? $m[1] : null;
-			self::record_refund_error(
-				$order,
-				NormalizedError::from(
-					ErrorCode::PROVIDER,
-					$e->getMessage(),
-					[
-						'raw_code' => $raw_code,
-						'provider' => $this->id,
-					]
-				)
-			);
+			self::fail_gateway_refund( $order, $refund, '藍新金流', $e->getMessage(), $raw_code );
 		}
 	}
 
