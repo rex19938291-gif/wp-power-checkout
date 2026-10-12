@@ -56,9 +56,19 @@ const form = reactive<TFormData>({
 
 	// --- 付款方式與分期 --- //
 	allowedPayments: [],
+	enableInstallment: false,
 	installmentPeriods: [],
 	twqrLifeTime: 300,
 })
+
+/**
+ * 將後端回傳的開關值正規化為 boolean
+ *
+ * provider 未啟用時 API 回傳 wp_options 原始值（REST 儲存經 sanitize_text_field 會變 '1' / ''），
+ * 啟用時則為 DTO 正規化後的 boolean，兩者皆需支援。
+ */
+const toBoolean = (value: unknown): boolean =>
+	['1', 'yes', 'true', 'on'].includes(String(value).toLowerCase())
 
 watch(
 	data,
@@ -70,6 +80,7 @@ watch(
 				filteredData.mode = 'prod'
 			}
 			merge(form, filteredData)
+			form.enableInstallment = toBoolean(newData.enableInstallment)
 		}
 	},
 	{ immediate: true }
@@ -77,8 +88,14 @@ watch(
 
 const isTestMode = computed(() => form.mode === 'test')
 
+// 勾選信用卡才顯示「在藍新付款頁顯示信用卡分期」開關
 const showInstallment = computed(() =>
 	form.allowedPayments.includes(ENewebpayMpgPaymentMethod.CREDIT)
+)
+
+// 勾選信用卡且開關開啟，才顯示分期期數
+const showInstallmentPeriods = computed(
+	() => showInstallment.value && form.enableInstallment
 )
 
 const showTwqrLifeTime = computed(() =>
@@ -126,6 +143,21 @@ const rules = reactive<FormRules<TFormData>>({
 					form.version !== '2.3'
 				) {
 					callback(new Error('TWQR 付款方式需將 MPG 版本設為 2.3'))
+					return
+				}
+				callback()
+			},
+		},
+	],
+	installmentPeriods: [
+		{
+			validator: (_, value, callback) => {
+				// 開關開啟時至少要勾一個期數，否則後端不會送 InstFlag
+				if (
+					showInstallmentPeriods.value &&
+					(!Array.isArray(value) || value.length === 0)
+				) {
+					callback(new Error('開啟信用卡分期時，請至少選擇一個分期期數'))
 					return
 				}
 				callback()
@@ -331,8 +363,23 @@ const rules = reactive<FormRules<TFormData>>({
 			</el-checkbox-group>
 		</el-form-item>
 
+		<el-form-item v-if="showInstallment" prop="enableInstallment">
+			<template #label>
+				<span class="flex gap-x-2 items-center">
+					<span>在藍新付款頁顯示信用卡分期</span>
+					<el-tooltip
+						content="需先於藍新商店後台開通信用卡分期；開啟後顧客可在藍新付款頁自行選擇一次付清或分期"
+						placement="top"
+					>
+						<el-icon><InfoFilled /></el-icon>
+					</el-tooltip>
+				</span>
+			</template>
+			<el-switch v-model="form.enableInstallment" />
+		</el-form-item>
+
 		<el-form-item
-			v-if="showInstallment"
+			v-if="showInstallmentPeriods"
 			prop="installmentPeriods"
 			label="信用卡分期期數"
 		>

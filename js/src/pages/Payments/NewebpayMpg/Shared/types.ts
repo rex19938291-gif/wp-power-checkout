@@ -117,6 +117,9 @@ export type TFormData = {
 
 	// --- 付款方式與分期 --- //
 	allowedPayments: string[]
+
+	/** 在藍新付款頁顯示信用卡分期（預設關閉；需先於藍新商店後台開通信用卡分期） */
+	enableInstallment: boolean
 	installmentPeriods: number[]
 	twqrLifeTime: number
 }

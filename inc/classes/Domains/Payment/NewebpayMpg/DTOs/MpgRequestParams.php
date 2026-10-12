@@ -239,29 +239,63 @@ final class MpgRequestParams extends DTO {
 	}
 
 	/**
-	 * 解析信用卡分期 InstFlag
+	 * 解析信用卡分期 InstFlag（藍新原生支援逗號分隔期數，如 "3,6,12"，顧客於藍新付款頁自選一次付清或分期）
 	 *
-	 * 顧客於 checkout 選擇「分期」時（order meta _pc_newebpay_credit_variant='installment'），
-	 * 帶上該期數；否則不送（空字串）。分期期數須在後台白名單內。
+	 * 優先序（Issue #21）：
+	 *  a. order meta 覆寫（向後相容自行寫 meta 的第三方外掛）：
+	 *     `_pc_newebpay_credit_variant === 'installment'` 時，`_pc_newebpay_installment` 依 `,` 拆開並 trim，
+	 *     每段須為純數字（ctype_digit）且在後台 installmentPeriods 白名單內，通過則以 `,` 重組（如 "3,6"）；
+	 *     任一段不合法 → throw（亦杜絕 `(int) "3,9"` 轉型成 3 而誤通過的副作用）。
+	 *  b. 後台開關 enableInstallment 開啟、allowedPayments 含 CREDIT、installmentPeriods 非空
+	 *     → 送排序去重後以 `,` 串接的期數（如 "3,6,12"）。
+	 *  c. 其他 → 空字串（不送 InstFlag，collect_trade_params 會過濾）。
 	 *
 	 * @param \WC_Order      $order    訂單
 	 * @param MpgSettingsDTO $settings 設定
 	 *
-	 * @return string InstFlag（如 "6"；空字串不送）
-	 * @throws \Exception 分期期數不在允許範圍
+	 * @return string InstFlag（如 "3,6,12"；空字串不送）
+	 * @throws \Exception 分期期數不在允許範圍（僅 a. meta 覆寫時）
 	 */
 	private static function resolve_inst_flag( \WC_Order $order, MpgSettingsDTO $settings ): string {
 		$meta_keys = new MpgMetaKeys( $order );
-		if ( 'installment' !== $meta_keys->get_credit_variant() ) {
-			return '';
+
+		// a. order meta 覆寫
+		if ( 'installment' === $meta_keys->get_credit_variant() ) {
+			return self::resolve_inst_flag_override( $meta_keys->get_installment(), $settings->installmentPeriods );
 		}
 
-		$installment = $meta_keys->get_installment();
-		if ( '' === $installment || ! \in_array( (int) $installment, $settings->installmentPeriods, true ) ) {
-			throw new \Exception( '分期期數不在允許範圍' );
+		// b. 後台開關：在藍新付款頁顯示信用卡分期
+		$has_credit = \in_array( MpgPaymentMethod::CREDIT->value, $settings->allowedPayments, true );
+		if ( ! $settings->enableInstallment || ! $has_credit || [] === $settings->installmentPeriods ) {
+			return ''; // c. 不送
 		}
 
-		return $installment;
+		$periods = \array_values( \array_unique( $settings->installmentPeriods ) );
+		\sort( $periods, SORT_NUMERIC );
+
+		return \implode( ',', $periods );
+	}
+
+	/**
+	 * 驗證並正規化 order meta 指定的分期期數（逗號分隔，如 "3,6"）
+	 *
+	 * @param string     $installment 期數字串（_pc_newebpay_installment）
+	 * @param array<int> $allowed     後台 installmentPeriods 白名單
+	 *
+	 * @return string 以 `,` 重組的期數（每段正規化為整數字串，如 " 3, 6 " → "3,6"）
+	 * @throws \Exception 分期期數不在允許範圍（空字串 / 空段 / 非純數字 / 不在白名單）
+	 */
+	private static function resolve_inst_flag_override( string $installment, array $allowed ): string {
+		$periods = [];
+		foreach ( \explode( ',', $installment ) as $segment ) {
+			$segment = \trim( $segment );
+			if ( ! \ctype_digit( $segment ) || ! \in_array( (int) $segment, $allowed, true ) ) {
+				throw new \Exception( '分期期數不在允許範圍' );
+			}
+			$periods[] = (string) (int) $segment;
+		}
+
+		return \implode( ',', $periods );
 	}
 
 	/** @return void 初始化前處理：搬出 hashKey / hashIv 到 private 屬性 */

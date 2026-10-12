@@ -98,6 +98,16 @@ final class MpgSettingsDTO extends DTO implements IGatewaySettings {
 	 */
 	public array $allowedPayments = [ 'CREDIT' ];
 
+	/**
+	 * @var bool 是否在藍新付款頁顯示信用卡分期（Issue #21）
+	 *
+	 * 開啟且 allowedPayments 含 CREDIT、installmentPeriods 非空時，建單一律送 InstFlag（如 "3,6,12"），
+	 * 由顧客在藍新付款頁自行選擇一次付清或分期。
+	 * 預設關閉：installmentPeriods 預設即有 6 個期數且多半已存進 DB，若直接一律送 InstFlag，
+	 * 未於藍新商店後台開通信用卡分期的既有商家會突然被影響。
+	 */
+	public bool $enableInstallment = false;
+
 	/** @var array<int> 信用卡分期期數（藍新 InstFlag：3,6,12,18,24,30） */
 	public array $installmentPeriods = [ 3, 6, 12, 18, 24, 30 ];
 
@@ -129,6 +139,14 @@ final class MpgSettingsDTO extends DTO implements IGatewaySettings {
 				continue;
 			}
 			$this->dto_data[ $key ] = (int) $this->dto_data[ $key ];
+		}
+
+		// enableInstallment 正規化為 bool（REST 設定儲存經 sanitize_text_field 會變 '1' / ''；亦相容 'yes' / 'no' / 布林）
+		if ( isset( $this->dto_data['enableInstallment'] ) ) {
+			$this->dto_data['enableInstallment'] = \filter_var(
+				$this->dto_data['enableInstallment'],
+				FILTER_VALIDATE_BOOLEAN
+			);
 		}
 
 		// installmentPeriods 一律正規化為 int（admin form 送來可能是字串，供 strict in_array 比對）
