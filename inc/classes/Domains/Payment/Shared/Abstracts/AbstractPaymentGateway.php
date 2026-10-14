@@ -332,6 +332,15 @@ abstract class AbstractPaymentGateway extends \WC_Payment_Gateway implements IPa
 			return;
 		}
 
+		// 付款頁只處理持有正確訂單 key 且仍需付款的訂單。
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended -- 訂單 key 用於此付款頁存取驗證。
+		$order_key = $_GET['key'] ?? '';
+		if ( ! \is_string( $order_key ) || '' === $order_key
+			|| ! \hash_equals( $order->get_order_key(), \wp_unslash( $order_key ) )
+			|| ! $order->needs_payment() ) {
+			return;
+		}
+
 		if ($this->id === $order->get_payment_method() ) {
 			$this->record_exception_to_order_note($order);
 			$this->before_order_received( $order );

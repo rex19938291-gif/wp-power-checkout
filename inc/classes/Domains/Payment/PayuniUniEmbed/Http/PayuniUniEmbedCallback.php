@@ -13,7 +13,7 @@
  *  - 驗章鏈：外層 Status=SUCCESS → MerID timing-safe 比對 → EncryptInfo / HashInfo 存在
  *    → HashInfo 長度守衛（SHA256 = 64 hex）→ HashInfo timing-safe 驗章（hash_equals）
  *    → AES-256-GCM 解密（AuthTag 驗證）→ 以 MerTradeNo 反查訂單（_pc_payuni_uni_trade_no，PCE）
- *    → 冪等（已 processing skip）→ StatusManager。
+ *    → 冪等（已付款、終態或相同 TradeNo skip）→ StatusManager。
  *  - 所有失敗分支（外層 Status 非 SUCCESS / MerID 不符 / 缺 EncryptInfo / HashInfo 長度異常 /
  *    驗章失敗 / 解密失敗 / 查無訂單 / 任何 \Throwable）一律回 HTTP 200，避免 PAYUNi 重送風暴；
  *    不更新狀態時 log warning，不外露內部錯誤。
@@ -115,7 +115,7 @@ final class PayuniUniEmbedCallback extends ApiBase {
 	 *  6. HashInfo timing-safe 驗章（verify_hash 內含 hash_equals）→ 失敗 log + return。
 	 *  7. AES-256-GCM 解密 → 解密失敗 throw（呼叫端 catch 仍回 200）。
 	 *  8. 以 MerTradeNo（_pc_payuni_uni_trade_no，PCE）反查訂單 → 查無 log + return。
-	 *  9. 冪等：已 processing → skip。
+	 *  9. 冪等：已付款、終態或相同 TradeNo → skip。
 	 *  10. StatusManager::update_order_status()。
 	 *
 	 * @param array<string, mixed> $params 外層 Form POST body（含 Status / MerID / EncryptInfo / HashInfo）
@@ -179,8 +179,11 @@ final class PayuniUniEmbedCallback extends ApiBase {
 			return;
 		}
 
-		// 8. 冪等：已 processing 則 skip（PAYUNi 重送通知不重複處理）
-		if ( $order->has_status( OrderStatus::PROCESSING->value ) ) {
+		// 8. 已付款、終態或相同 TradeNo 不再處理
+		$trade_no = (string) ( $inner['TradeNo'] ?? '' );
+		if ( $order->is_paid()
+			|| $order->has_status( [ OrderStatus::COMPLETED->value, OrderStatus::REFUNDED->value, OrderStatus::CANCELLED->value ] )
+			|| ( '' !== $trade_no && $trade_no === (string) $order->get_transaction_id() ) ) {
 			return;
 		}
 

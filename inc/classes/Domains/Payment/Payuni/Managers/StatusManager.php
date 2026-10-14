@@ -11,7 +11,7 @@
  *  - 金額 / 狀態判定一律以「驗章後的 PAYUNi 回傳資料」為準，絕不信任前端。
  *  - 轉 processing 前比對內層 TradeAmt（int）與訂單應收（ceil 整數）；不符 → 維持 pending + 告警，絕不 payment_complete。
  *  - StatusManager 作為最後防線：外層 Status 非 SUCCESS、MerID 不符商店設定 → 一律不更新訂單（防跨商店污染 / 偽造）。
- *  - 冪等：已 processing 不重複 payment_complete。
+ *  - 已付款、終態或相同 TradeNo 不重複處理。
  *
  * @see .claude/skills/payuni-upp-v2/references/upp-response-params.md §內層通用欄位 / §虛擬帳號 / §超商代碼
  * @see specs/features/payment/payuni-upp-callback.feature
@@ -59,6 +59,13 @@ final class StatusManager {
 	 * @return void
 	 */
 	public function update_order_status(): void {
+		$trade_no = (string) ( $this->inner_payload['TradeNo'] ?? '' );
+		if ( $this->order->is_paid()
+			|| $this->order->has_status( [ OrderStatus::COMPLETED->value, OrderStatus::REFUNDED->value, OrderStatus::CANCELLED->value ] )
+			|| ( '' !== $trade_no && $trade_no === (string) $this->order->get_transaction_id() ) ) {
+			return;
+		}
+
 		// 最後防線 1：外層 / 內層 Status 非 SUCCESS → 不信任此 payload，維持 pending。
 		$status = (string) ( $this->inner_payload['Status'] ?? '' );
 		if ( self::STATUS_SUCCESS !== $status ) {
@@ -98,17 +105,12 @@ final class StatusManager {
 	/**
 	 * 處理已付款（TradeStatus=1）
 	 *
-	 * 冪等：已 processing 不重複 payment_complete。
+	 * 已付款、終態或相同 TradeNo 不重複處理。
 	 * 金額防竄改：TradeAmt 不符訂單應收 → 維持 pending + 告警，絕不 payment_complete。
 	 *
 	 * @return void
 	 */
 	private function handle_paid(): void {
-		// 冪等：已 processing 則不重複 payment_complete（PAYUNi 可能重送通知）
-		if ( $this->order->has_status( OrderStatus::PROCESSING->value ) ) {
-			return;
-		}
-
 		// 金額防竄改（資安最關鍵）：TradeAmt 不符 → 維持 pending + 告警 note
 		if ( ! $this->is_amount_matched() ) {
 			$this->order->add_order_note(

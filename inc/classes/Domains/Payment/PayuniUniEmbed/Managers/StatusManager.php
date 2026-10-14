@@ -11,7 +11,7 @@
  *  - 金額 / 狀態判定一律以「驗章後的 PAYUNi 回傳資料」為準，絕不信任前端。
  *  - 轉 processing 前比對內層 TradeAmt（int）與訂單應收（ceil 整數）；不符 → 維持 pending + 告警。
  *  - 外層 Status 非 SUCCESS、MerID 不符商店設定 → 一律不更新訂單。
- *  - 冪等：已 processing 不重複 payment_complete。
+ *  - 已付款、終態或相同 TradeNo 不重複處理。
  *
  * ⚠️ Cycle 1 僅建立骨架；實際觸發點（merchant_trade 回應 / NotifyURL callback）於 Cycle 2 / 3 接上。
  *
@@ -55,6 +55,13 @@ final class StatusManager {
 	 * @return void
 	 */
 	public function update_order_status(): void {
+		$trade_no = (string) ( $this->inner_payload['TradeNo'] ?? '' );
+		if ( $this->order->is_paid()
+			|| $this->order->has_status( [ OrderStatus::COMPLETED->value, OrderStatus::REFUNDED->value, OrderStatus::CANCELLED->value ] )
+			|| ( '' !== $trade_no && $trade_no === (string) $this->order->get_transaction_id() ) ) {
+			return;
+		}
+
 		// 最後防線 1：外層 / 內層 Status 非 SUCCESS → 維持 pending。
 		$status = (string) ( $this->inner_payload['Status'] ?? '' );
 		if ( self::STATUS_SUCCESS !== $status ) {
@@ -88,17 +95,12 @@ final class StatusManager {
 	/**
 	 * 處理已付款（TradeStatus=1）
 	 *
-	 * 冪等：已 processing 不重複 payment_complete。
+	 * 已付款、終態或相同 TradeNo 不重複處理。
 	 * 金額防竄改：TradeAmt 不符 → 維持 pending + 告警，絕不 payment_complete。
 	 *
 	 * @return void
 	 */
 	private function handle_paid(): void {
-		// 冪等：已 processing 則不重複 payment_complete（PAYUNi 可能重送通知）
-		if ( $this->order->has_status( OrderStatus::PROCESSING->value ) ) {
-			return;
-		}
-
 		// Gateway 守衛：UNi Embed 回傳 Gateway 固定為 9（IFrame）。
 		// 非 9（如 UPP 的 2）代表交易來源錯置 / 偽造 → 維持 pending（防 UPP 回調混入 UNi Embed 路徑）。
 		if ( ! $this->is_gateway_matched() ) {
