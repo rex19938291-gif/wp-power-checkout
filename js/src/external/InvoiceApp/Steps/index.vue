@@ -28,7 +28,7 @@ const active = ref(0)
 const formRef = ref()
 
 // 表單資料
-const DEFAULT_FORM = {
+const DEFAULT_FORM: TFormData = {
 	provider: '', // 服務提供商
 	invoiceType: undefined, // 發票類型
 	individual: undefined, // 個人發票類型 雲端載具、手機條碼、自然人憑證
@@ -39,7 +39,8 @@ const DEFAULT_FORM = {
 	donateCode: '', // 捐贈碼
 }
 
-const form = reactive<TFormData>(DEFAULT_FORM)
+// 用副本建立 reactive，避免表單編輯時改到 DEFAULT_FORM 本身
+const form = reactive<TFormData>({ ...DEFAULT_FORM })
 
 const prev = () => {
 	if (active.value-- < 0) active.value = 0
@@ -142,15 +143,72 @@ const handleIssue = async () => {
 	})
 }
 
-// 每次開啟 dialog 重置表單
+const STRING_FIELDS = [
+	'carrier',
+	'moica',
+	'companyName',
+	'companyId',
+	'donateCode',
+] as const
+
+/**
+ * 讀取結帳頁隱藏欄位中已儲存的發票資料
+ * 只有結帳頁的 render id 是 input；後台 metabox 是 div，會回傳 null
+ * 服務商已停用、發票種類不合法時視為無資料，讓顧客重新選擇
+ */
+const getSavedForm = (): TFormData | null => {
+	const render_ids = appData?.render_ids || []
+	for (const id of render_ids) {
+		const input = document.getElementById(id)
+		if (!(input instanceof HTMLInputElement) || !input.value) {
+			continue
+		}
+
+		try {
+			const saved = JSON.parse(input.value)
+			const isValidProvider = providers.some(
+				(provider) => provider.id === saved?.provider
+			)
+			const isValidInvoiceType = invoiceTypes.some(
+				(item) => item.value === saved?.invoiceType
+			)
+			if (!isValidProvider || !isValidInvoiceType) {
+				return null
+			}
+
+			const savedForm: TFormData = {
+				...DEFAULT_FORM,
+				provider: saved.provider,
+				invoiceType: saved.invoiceType,
+				individual: individuals.some((item) => item.value === saved.individual)
+					? saved.individual
+					: undefined,
+			}
+			STRING_FIELDS.forEach((key) => {
+				if (typeof saved[key] === 'string') {
+					savedForm[key] = saved[key]
+				}
+			})
+			return savedForm
+		} catch {
+			return null
+		}
+	}
+	return null
+}
+
+// 每次開啟 dialog：有已儲存的發票資料就帶回並停在最後一步，否則重置表單
+// dialog 內容在第一次開啟時才 mount，需 immediate 才能涵蓋第一次開啟
 watch(
 	() => props.dialogVisible,
 	(visible) => {
 		if (!visible) return
 		formRef.value?.resetFields()
-		Object.assign(form, DEFAULT_FORM)
-		active.value = 0
-	}
+		const savedForm = getSavedForm()
+		Object.assign(form, savedForm ?? DEFAULT_FORM)
+		active.value = savedForm ? 2 : 0
+	},
+	{ immediate: true }
 )
 
 const CARRIER_PATTERN = /^\/[0-9A-Z+\-.]{7}$/
@@ -185,7 +243,12 @@ const rules = reactive<FormRules<TFormData>>({
 </script>
 
 <template>
-	<el-steps :active="active" finish-status="finish" align-center class="my-8">
+	<el-steps
+		:active="active"
+		finish-status="finish"
+		align-center
+		class="pc-invoice-steps my-8"
+	>
 		<el-step title="選擇服務提供商" />
 		<el-step title="選擇發票種類" />
 		<el-step title="填寫發票資料" />
@@ -209,7 +272,7 @@ const rules = reactive<FormRules<TFormData>>({
 		>
 			<el-radio-group
 				v-model="form.provider"
-				class="grid grid-cols-3 gap-4 [&_label]:w-full w-full"
+				class="pc-invoice-radio-grid grid grid-cols-1 sm:grid-cols-3 gap-4 [&_label]:w-full w-full"
 			>
 				<el-radio
 					v-for="provider in providers"
@@ -230,7 +293,7 @@ const rules = reactive<FormRules<TFormData>>({
 		>
 			<el-radio-group
 				v-model="form.invoiceType"
-				class="grid grid-cols-3 gap-4 [&_label]:w-full w-full"
+				class="pc-invoice-radio-grid grid grid-cols-1 sm:grid-cols-3 gap-4 [&_label]:w-full w-full"
 			>
 				<el-radio
 					v-for="item in invoiceTypes"
@@ -255,7 +318,7 @@ const rules = reactive<FormRules<TFormData>>({
 			>
 				<el-radio-group
 					v-model="form.individual"
-					class="grid grid-cols-3 gap-4 [&_label]:w-full w-full"
+					class="pc-invoice-radio-grid grid grid-cols-1 sm:grid-cols-3 gap-4 [&_label]:w-full w-full"
 				>
 					<el-radio
 						v-for="item in individuals"
@@ -355,7 +418,7 @@ const rules = reactive<FormRules<TFormData>>({
 			type="primary"
 			:loading="isPending"
 			@click="handleIssue"
-			>{{ MAPPER.ISSUE_INVOICE }}</el-button
+			>{{ MAPPER.SUBMIT }}</el-button
 		>
 	</div>
 </template>
@@ -367,5 +430,22 @@ const rules = reactive<FormRules<TFormData>>({
 	top: unset !important;
 	max-width: unset !important;
 	margin: 0 30px 0 0;
+}
+
+/* 發票選項以 grid 排列，間距交給 gap；高度隨文字撐開，避免窄螢幕截斷或超出外框 */
+.pc-invoice-radio-grid .el-radio.is-bordered {
+	height: auto;
+	min-height: 32px;
+	margin: 0;
+	padding-top: 4px;
+	padding-bottom: 4px;
+	white-space: normal;
+}
+
+/* 窄螢幕縮小步驟標題，避免折行 */
+@media (max-width: 575px) {
+	.pc-invoice-steps .el-step__title {
+		font-size: 13px;
+	}
 }
 </style>

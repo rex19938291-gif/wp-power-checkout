@@ -18,9 +18,11 @@ export const isAdmin = !!appData?.is_admin
 
 const MAPPER_ADMIN = {
     ISSUE_INVOICE: '開立發票',
+    SUBMIT: '開立發票',
 }
 const MAPPER_CHECKOUT = {
     ISSUE_INVOICE: '設定發票資訊',
+    SUBMIT: '儲存',
 }
 export const MAPPER = isAdmin ? MAPPER_ADMIN : MAPPER_CHECKOUT
 

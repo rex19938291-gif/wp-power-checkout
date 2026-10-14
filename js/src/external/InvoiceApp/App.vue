@@ -62,10 +62,10 @@ const handleCancel = () => {
 	<el-dialog
 		v-model="dialogVisible"
 		:title="MAPPER.ISSUE_INVOICE"
-		width="600"
+		width="min(600px, calc(100vw - 32px))"
 		align-center
 		:z-index="999999"
-		class="p-8"
+		class="p-4 sm:p-8"
 	>
 		<Steps :dialog-visible="dialogVisible" @close="dialogVisible = false" />
 	</el-dialog>
